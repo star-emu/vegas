@@ -1,0 +1,40 @@
+#version 460 core
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform texture2D uInput;
+layout(set = 0, binding = 1, rgba8) uniform image2D uOutput;
+
+layout(push_constant) uniform uPC { vec4 info; } pc;
+
+float cubic(float t) {
+    float at = abs(t);
+    float at2 = at * at;
+    float at3 = at2 * at;
+    float c1 = 1.5 * at3 - 2.5 * at2 + 1.0;
+    float c2 = -0.5 * at3 + 2.5 * at2 - 4.0 * at + 2.0;
+    return mix(c2, c1, step(at, 1.0)) * step(at, 2.0);
+}
+
+void main() {
+    ivec2 ip = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dstSize = imageSize(uOutput);
+    if (ip.x >= dstSize.x || ip.y >= dstSize.y) return;
+
+    vec2 pos = (vec2(ip) + vec2(0.5)) * vec2(pc.info.x, pc.info.y)
+               - vec2(pc.info.z, pc.info.w);
+    vec2 f = fract(pos);
+    ivec2 tc = ivec2(pos);
+
+    vec4 color = vec4(0.0);
+    float sum = 0.0;
+    for (int j = -1; j <= 2; j++) {
+        for (int i = -1; i <= 2; i++) {
+            float w = cubic(float(i) - f.x) * cubic(float(j) - f.y);
+            color += texelFetch(uInput, tc + ivec2(i, j), 0) * w;
+            sum += w;
+        }
+    }
+    imageStore(uOutput, ip, clamp(color / max(sum, 1e-8), 0.0, 1.0));
+}

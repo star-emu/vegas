@@ -1,0 +1,87 @@
+name: Release (Experimental)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # ----------------------------------------------------------------
+  # Scavenge the latest successful build artifact from build.yml
+  # ----------------------------------------------------------------
+  scavenge:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.get-sha.outputs.sha }}
+    steps:
+      - id: get-sha
+        run: |
+          API=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build.yml/runs?branch=vegas&status=success&per_page=1")
+          FULL_SHA=$(echo "$API" | python3 -c "import sys,json; print(json.load(sys.stdin)['workflow_runs'][0]['head_sha'])")
+          RUN_ID=$(echo "$API" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['workflow_runs'][0]['id'])")
+          echo "full_sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
+          echo "sha=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifact from build.yml
+        uses: actions/download-artifact@v4
+        with:
+          name: dxvk-${{ steps.get-sha.outputs.full_sha }}
+          path: ./dlls
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.get-sha.outputs.run_id }}
+
+      - name: Upload as vegas artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vegas-${{ steps.get-sha.outputs.sha }}
+          path: ./dlls
+
+  # ----------------------------------------------------------------
+  # Package DLLs into Winlator Content Package (.wcp)
+  # ----------------------------------------------------------------
+  package-wcp:
+    needs: scavenge
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install zstd
+        run: sudo apt-get update -y && sudo apt-get install -y zstd
+
+      - name: Download DLLs
+        uses: actions/download-artifact@v4
+        with:
+          name: vegas-${{ needs.scavenge.outputs.sha }}
+          path: ./dxvk
+
+      - name: Create WCP
+        run: |
+          cd ./dxvk
+          mv x64 system32
+          mv x32 syswow64
+          cat > profile.json << 'JSONEOF'
+          {
+            "type": "DXVK",
+            "versionName": "2.7.3-vegas",
+            "versionCode": 0,
+            "description": "VEGAS — Community DXVK fork optimized for Android/Winlator",
+            "files": [
+              {"source": "system32/d3d9.dll",      "target": "${system32}/d3d9.dll"},
+              {"source": "system32/d3d10core.dll", "target": "${system32}/d3d10core.dll"},
+              {"source": "system32/d3d11.dll",     "target": "${system32}/d3d11.dll"},
+              {"source": "system32/dxgi.dll",      "target": "${system32}/dxgi.dll"},
+              {"source": "syswow64/d3d8.dll",      "target": "${syswow64}/d3d8.dll"},
+              {"source": "syswow64/d3d9.dll",      "target": "${syswow64}/d3d9.dll"},
+              {"source": "syswow64/d3d10core.dll", "target": "${syswow64}/d3d10core.dll"},
+              {"source": "syswow64/d3d11.dll",     "target": "${syswow64}/d3d11.dll"},
+              {"source": "syswow64/dxgi.dll",      "target": "${syswow64}/dxgi.dll"}
+            ]
+          }
+          JSONEOF
+          tar --zstd -cf "../dxvk-2.7.3-vegas-${{ needs.scavenge.outputs.sha }}.wcp" \
+            system32/ syswow64/ profile.json
+
+      - name: Upload WCP
+        uses: actions/upload-artifact@v4
+        with:
+          name: wcp-${{ needs.scavenge.outputs.sha }}
+          path: ./dxvk-*.wcp
