@@ -553,12 +553,13 @@ namespace dxvk {
         m_desc.Height ? nullptr : &m_desc.Height);
     }
 
-    // --- VEGAS: update aspect ratio for letterboxing ---
+    // --- VEGAS: compute letterbox scale factors ---
     Vegas::calculateAspectRatio(m_desc.Width, m_desc.Height,
         m_aspectRatioX, m_aspectRatioY);
     Logger::debug(str::format(
-        "Vegas: AspectRatio=", m_aspectRatioX, "x", m_aspectRatioY,
-        " (", m_desc.Width, "x", m_desc.Height, ")"));
+        "Vegas: LetterboxScale=", m_aspectRatioX, "x", m_aspectRatioY,
+        " @ ", m_desc.Width, "x", m_desc.Height,
+        " (AR=", (m_desc.Height ? static_cast<float>(m_desc.Width) / static_cast<float>(m_desc.Height) : 0.0f), ":1)"));
     // --- END VEGAS ---
     
     if (BufferCount != 0)

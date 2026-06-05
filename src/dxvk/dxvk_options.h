@@ -81,6 +81,11 @@ namespace dxvk {
     /// Enables FSR 1.0 spatial upscaler (Auto/True/False)
     /// Only effective when enableStarProfile is not False.
     Tristate vegasEnableUpscaler = Tristate::Auto;
+
+    /// Override GPU tier (0 = auto-detect, 1 = entry, 2 = mid, 3 = high).
+    /// Forces the tier detected by the GPU-name classifier to this value.
+    /// Useful for misclassified Adreno GPUs or manual tuning.
+    int32_t vegasForceTier = 0;
   };
 
 }

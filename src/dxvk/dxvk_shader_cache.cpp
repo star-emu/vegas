@@ -451,22 +451,36 @@ namespace dxvk {
     while (!stop) {
       std::unique_lock lock(m_writeMutex);
 
-      m_writeCond.wait(lock, [this] {
+      // Wait for new entries with a 60-second periodic timeout.
+      // This ensures partially-filled batches get flushed to disk
+      // even if the process is killed before clean shutdown.
+      bool gotEntry = m_writeCond.wait_for(lock,
+          std::chrono::seconds(60), [this] {
         return !m_writeQueue.empty();
       });
 
-      auto entry = std::move(m_writeQueue.front());
-      m_writeQueue.pop();
+      // Drain as many entries as we have room for
+      while (!m_writeQueue.empty() && !stop) {
+        auto entry = std::move(m_writeQueue.front());
+        m_writeQueue.pop();
+
+        if (!entry) {
+          stop = true;   // nullptr sentinel → shutdown
+        } else {
+          localQueue.push_back(std::move(entry));
+        }
+
+        // Leave remaining entries in queue if local batch is full
+        if (!stop && localQueue.size() >= localQueue.capacity())
+          break;
+      }
+
+      // Flush when batch is full, or on shutdown, or on timeout
+      bool drain = (stop && !localQueue.empty())
+                || localQueue.size() >= localQueue.capacity()
+                || (!gotEntry && !localQueue.empty());
 
       lock.unlock();
-
-      stop = !entry;
-      bool drain = stop;
-
-      if (entry) {
-        localQueue.push_back(std::move(entry));
-        drain = localQueue.size() == localQueue.capacity();
-      }
 
       if (drain) {
         std::unique_lock fileLock(m_fileMutex);

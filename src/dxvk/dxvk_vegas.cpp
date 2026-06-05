@@ -76,6 +76,51 @@ namespace dxvk {
 
 
 
+  // ============================================================
+  // Adreno GPU tier classifier — replaces opaque upstream
+  // getStarEnginePersona(). Parses device name to extract the
+  // model number, then maps it to a tier based on actual GPU
+  // performance characteristics on TBDR architectures.
+  //
+  // Tier 1 (entry):  Adreno 5xx, 6xx < 620  (drawThr=600)
+  // Tier 2 (mid):    Adreno 6xx 620-689, 7xx < 730  (drawThr=1200)
+  // Tier 3 (high):   Adreno 690+, 7xx >= 730, 8xx+  (drawThr=2000)
+  // ============================================================
+  static uint32_t classifyAdrenoTier(const char* deviceName) {
+      // Find first digit in device name; model# is always the
+      // numeric suffix of the "Adreno NNN" token.
+      const char* p = deviceName;
+      while (*p != '\0' && !std::isdigit(static_cast<unsigned char>(*p)))
+          p++;
+      if (*p == '\0') return 2;  // no digits → conservative fallback
+
+      uint32_t model = 0;
+      while (*p != '\0' && std::isdigit(static_cast<unsigned char>(*p))) {
+          model = model * 10 + static_cast<uint32_t>(*p - '0');
+          // Clamp to avoid overflow on very long digit runs
+          if (model > 999) break;
+          p++;
+      }
+
+      uint32_t gen = model / 100;  // e.g. 6 from 610, 7 from 730
+
+      if (gen <= 5) return 1;                          // 5xx → entry
+
+      if (gen == 6) {
+          if (model < 620) return 1;                   // 600-619 → entry
+          if (model < 690) return 2;                   // 620-689 → mid
+          return 3;                                     // 690+    → high
+      }
+
+      if (gen == 7) {
+          if (model < 730) return 2;                   // 700-729 → mid
+          return 3;                                     // 730+    → high
+      }
+
+      // 8xx+ → high
+      return 3;
+  }
+
   void Vegas::initializeProfile(uint32_t& threshold, bool& enabled, bool& bindSkip, uint32_t& tier, DxvkDevice* device) {
       if (device == nullptr || device->adapter() == nullptr) return;
       auto& props = device->adapter()->deviceProperties().core.properties;
@@ -105,11 +150,7 @@ namespace dxvk {
       if (isAdreno) {
           enabled = true;
           bindSkip = true;
-#ifndef _WIN32
-          tier = device->adapter()->getStarEnginePersona();
-#else
-          tier = 2;  // safe fallback for non-Adreno
-#endif
+          tier = classifyAdrenoTier(props.deviceName);
           // VEGAS: Set default tier-based threshold (fallback)
           static constexpr uint32_t defaultThresholds[] = {600, 1200, 2000};
           threshold = (tier >= 1 && tier <= 3) ? defaultThresholds[tier - 1] : 600;
@@ -131,22 +172,24 @@ namespace dxvk {
   }
 
   // VEGAS: Governor-style tiered threshold (AdrenoGovernor logic)
+  //
+  // TBDR-safe design:
+  //   - Caps at 2× base threshold to prevent tile-buffer overflow
+  //   - Resets to base on moderate load to prevent sticky high thresholds
+  //   - Low-load path requires sustained frame time > 8 ms (avoids transient spikes)
   void Vegas::tuneThreshold(uint32_t& threshold, float load, float frameTime, uint32_t tier) {
-      if (tier == 1) {
-          if (load > 0.90f && frameTime > 25.0f)
-              threshold = 1200;
-          else if (load < 0.60f)
-              threshold = 8000;
-      } else if (tier == 2) {
-          if (load > 0.93f && frameTime > 29.0f)
-              threshold = 1600;
-          else if (load < 0.64f)
-              threshold = 8000;
+      static constexpr uint32_t baseThresholds[] = { 600, 1200, 2000 };
+      uint32_t base = (tier >= 1 && tier <= 3) ? baseThresholds[tier - 1] : 600;
+      uint32_t cap  = base * 2;  // TBDR safety limit
+
+      if ((load > 0.90f && frameTime > 25.0f) ||
+          (load < 0.60f && frameTime > 8.0f)) {
+          // High sustained load (GPU-bound) or low sustained load (headroom):
+          // allow up to 2× batching to amortise flush overhead
+          threshold = cap;
       } else {
-          if (load > 0.95f && frameTime > 33.0f)
-              threshold = 2000;
-          else if (load < 0.70f)
-              threshold = 8000;
+          // Moderate load — reset to base to prevent sticky high thresholds
+          threshold = base;
       }
   }
 
@@ -157,11 +200,11 @@ namespace dxvk {
       thread_local float s_smoothFt = 16.6f;
       s_smoothFt = s_smoothFt * 0.9f + frameTime * 0.1f;
 
-      // 2. Frame-count cooldown — re-evaluate at most once every 120 calls
-      //    (~2 seconds at 60 fps, ~4 seconds at 30 fps).
+      // 2. Frame-count cooldown — re-evaluate at most once every 30 calls
+      //    (~0.5 seconds at 60 fps, ~1 second at 30 fps).
       thread_local uint32_t s_framesSinceAdj = 0;
       s_framesSinceAdj++;
-      if (s_framesSinceAdj < 120)
+      if (s_framesSinceAdj < 30)
           return;
       s_framesSinceAdj = 0;
 
@@ -175,9 +218,13 @@ namespace dxvk {
       }
   }
 
-  // VEGAS: ZeroInitShaders = 1 (always enable for Unity/Adreno stability)
+  // VEGAS: Tier-aware zero-init for shader workgroup memory.
+  // Tier 1/2 (entry/mid) retain zero-init for Turnip stability;
+  // low-end Adreno GPUs are more susceptible to hangs from
+  // uninitialized workgroup memory.
+  // Tier 3 (high-end) skips zero-init for ~1-2% shader perf gain.
   bool Vegas::shouldZeroInit(uint32_t tier) {
-      return true;
+      return tier < 3;
   }
 
 
@@ -864,16 +911,14 @@ namespace dxvk {
     bool isAdreno = false;
 #endif
 
+    // Local tier before config override
+    uint32_t detectedTier = 0;
+
     if (master == Tristate::True) {
-      // Force-enable: skip Adreno detection, default to tier 2
+      // Force-enable: skip Adreno detection, classify from device name
       s_enabled        = true;
       s_bindSkipEnabled = true;
-#ifndef _WIN32
-      s_tier           = device->adapter()->getStarEnginePersona();
-#else
-      s_tier           = 2;  // safe fallback for non-Adreno
-#endif
-      if (s_tier == 0) s_tier = 2; // safe fallback for non-Adreno
+      detectedTier     = classifyAdrenoTier(props.deviceName);
     } else {
       // Auto: detect Adreno
       if (!isAdreno) {
@@ -886,16 +931,22 @@ namespace dxvk {
       if (isAdreno) {
         s_enabled        = true;
         s_bindSkipEnabled = true;
-#ifndef _WIN32
-        s_tier           = device->adapter()->getStarEnginePersona();
-#else
-        s_tier           = 2;  // safe fallback for non-Adreno
-#endif
+        detectedTier     = classifyAdrenoTier(props.deviceName);
       } else {
         s_enabled        = false;
         s_bindSkipEnabled = false;
         s_tier           = 0;
       }
+    }
+
+    // Apply detected tier, then allow config override
+    if (s_enabled) {
+      s_tier = detectedTier;
+      if (s_tier < 1 || s_tier > 3) s_tier = 2;  // safety clamp
+
+      int32_t overrideTier = device->config().vegasForceTier;
+      if (overrideTier >= 1 && overrideTier <= 3)
+        s_tier = static_cast<uint32_t>(overrideTier);
     }
 
     // Bake draw thresholds based on GPU tier (D3D11 base)

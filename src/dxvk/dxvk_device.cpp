@@ -114,6 +114,12 @@ namespace dxvk {
     // Without graphicsPipelineLibraryIndependentInterpolationDecoration, we
     // cannot use this effectively in many games since no client API provides
     // interpoation qualifiers in vertex shaders.
+    // GPL is incompatible with async pipeline compilation: the fast-linking
+    // path in compilePipeline returns early when GPL is True, which bypasses
+    // the async null-pipeline-skip mechanism and causes swapchain crashes
+    // on Turnip. Auto-disable when async is active.
+    if (m_options.enableAsync)
+        return false;
     return m_features.extGraphicsPipelineLibrary.graphicsPipelineLibrary
         && m_properties.extGraphicsPipelineLibrary.graphicsPipelineLibraryIndependentInterpolationDecoration
         && m_options.enableGraphicsPipelineLibrary != Tristate::False;
@@ -237,22 +243,11 @@ namespace dxvk {
     const DxvkImageCreateInfo&  createInfo,
           VkMemoryPropertyFlags memoryType) {
     // --- VEGAS: BCn→ASTC transcoding check (GATED) ---
-    // Rationale/activation checklist: see the long block comment above the
-    // anonymous namespace block in dxvk_vegas.cpp (~line 395) named
-    // "CPU-side BCn->ASTC transcoder"
-    if (Vegas::isEnabled()) {
-      VkFormat vegasFormat = Vegas::shouldTranscodeFormat(
-          createInfo.format,
-          createInfo.usage,
-          createInfo.extent,
-          m_adapter);
-      if (vegasFormat != VK_FORMAT_UNDEFINED) {
-        Logger::debug(str::format(
-            "Vegas: Image ", createInfo.extent.width, "x", createInfo.extent.height,
-            " format ", createInfo.format, " -> would transcode to ", vegasFormat,
-            " (not yet active — upload transcoding not wired)"));
-      }
-    }
+    // The shouldTranscodeFormat call is kept for future wiring but the
+    // per-image log was removed — it produced thousands of lines in every
+    // game with no actionable outcome since the upload transcoder is gated.
+    // See the "CPU-side BCn->ASTC transcoder" block comment in dxvk_vegas.cpp.
+    // When the transcoder is activated, re-add a rate-limited log here.
     // --- END VEGAS ---
 
     return new DxvkImage(this, createInfo, m_objects.memoryManager(), memoryType);

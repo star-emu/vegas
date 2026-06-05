@@ -527,13 +527,12 @@ namespace dxvk {
 
 
   void D3D11SwapChain::CreateBackBuffers() {
-    // Explicitly destroy current swap image before
-    // creating a new one to free up resources
-    m_backBuffers.clear();
-
     bool sequential = m_desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL ||
                       m_desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     uint32_t backBufferCount = sequential ? m_desc.BufferCount : 1u;
+
+    // Guard against games that specify BufferCount=0 with sequential
+    if (backBufferCount == 0) backBufferCount = 1;
 
     // Create new back buffer
     D3D11_COMMON_TEXTURE_DESC desc;
@@ -564,16 +563,25 @@ namespace dxvk {
     
     DXGI_USAGE dxgiUsage = DXGI_USAGE_BACK_BUFFER;
 
+    // Build new backbuffers in a local vector, then atomically swap
+    // with m_backBuffers. This avoids a window where GetImage sees an
+    // empty m_backBuffers during resize (the old clear()-then-push pattern).
+    std::vector<Com<D3D11Texture2D>> newBackBuffers;
+    newBackBuffers.reserve(backBufferCount);
+
     for (uint32_t i = 0; i < backBufferCount; i++) {
       if (m_desc.SwapEffect == DXGI_SWAP_EFFECT_DISCARD
        || m_desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD)
          dxgiUsage |= DXGI_USAGE_DISCARD_ON_PRESENT;
 
-      m_backBuffers.push_back(new D3D11Texture2D(
+      newBackBuffers.push_back(new D3D11Texture2D(
         m_parent, this, &desc, dxgiUsage));
 
       dxgiUsage |= DXGI_USAGE_READ_ONLY;
     }
+
+    // Swap atomically — the old vector is destroyed when it goes out of scope
+    m_backBuffers = std::move(newBackBuffers);
 
     small_vector<Rc<DxvkImage>, 4> images;
 
