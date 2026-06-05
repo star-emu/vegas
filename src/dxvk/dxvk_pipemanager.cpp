@@ -293,12 +293,9 @@ namespace dxvk {
   
   void DxvkPipelineManager::registerShader(
     const Rc<DxvkShader>&         shader) {
-    // --- VEGAS: zero-init shader resources (wired, decision logged) ---
-    if (Vegas::shouldZeroInit(Vegas::getTier())) {
-      Logger::debug(str::format(
-          "Vegas: Zero-init enabled for tier ", Vegas::getTier()));
-    }
-    // --- END VEGAS ---
+    // The zero-init decision is logged once in initializeProfile().
+    // This per-shader log was removed — it produced 3000+ lines
+    // per game with no diagnostic value per individual shader.
 
     DxvkShaderPipelineLibraryKey key;
     key.addShader(shader);

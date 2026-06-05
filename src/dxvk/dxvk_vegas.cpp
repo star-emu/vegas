@@ -957,6 +957,15 @@ namespace dxvk {
     s_drawThreshold = drawThresholdTable[idx];
     s_haaeThreshold = haaeThresholdTable[idx];
 
+    // Log tier, thresholds, and zero-init decision once (not per-shader)
+    if (s_enabled) {
+      Logger::debug(str::format(
+          "Vegas: Tier ", s_tier,
+          " drawThr=", s_drawThreshold,
+          " haaeThr=", s_haaeThreshold,
+          " zeroInit=", shouldZeroInit(s_tier)));
+    }
+
     // Store Vulkan device/queue handles for FSR dispatch.
     // The VkDevice handle from device->handle() is an opaque pointer
     // valid for the lifetime of DxvkDevice.
