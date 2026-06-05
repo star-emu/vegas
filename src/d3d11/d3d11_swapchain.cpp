@@ -566,7 +566,7 @@ namespace dxvk {
     // Build new backbuffers in a local vector, then atomically swap
     // with m_backBuffers. This avoids a window where GetImage sees an
     // empty m_backBuffers during resize (the old clear()-then-push pattern).
-    std::vector<Com<D3D11Texture2D>> newBackBuffers;
+    small_vector<Com<D3D11Texture2D, false>, 4> newBackBuffers;
     newBackBuffers.reserve(backBufferCount);
 
     for (uint32_t i = 0; i < backBufferCount; i++) {
