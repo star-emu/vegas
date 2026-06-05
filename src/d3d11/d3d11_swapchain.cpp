@@ -139,7 +139,12 @@ namespace dxvk {
     InitReturnPtr(ppBuffer);
 
     if (BufferId >= m_backBuffers.size()) {
-      Logger::err("D3D11: GetImage: Invalid buffer ID");
+      Logger::err(str::format(
+          "D3D11: GetImage: Invalid buffer ID ", BufferId,
+          " (backbuffers=", m_backBuffers.size(),
+          " BufferCount=", m_desc.BufferCount,
+          " SwapEffect=", m_desc.SwapEffect,
+          " Flags=", m_desc.Flags, ")"));
       return DXGI_ERROR_UNSUPPORTED;
     }
 
