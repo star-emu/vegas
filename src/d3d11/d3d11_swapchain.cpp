@@ -532,8 +532,12 @@ namespace dxvk {
 
 
   void D3D11SwapChain::CreateBackBuffers() {
+    // Both FLIP_SEQUENTIAL and FLIP_DISCARD are flip-model effects
+    // that require the actual backbuffer count from BufferDesc.
+    // DISCARD and SEQUENTIAL (bitblt) use a single buffer.
     bool sequential = m_desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL ||
-                      m_desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+                      m_desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL ||
+                      m_desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD;
     uint32_t backBufferCount = sequential ? m_desc.BufferCount : 1u;
 
     // Guard against games that specify BufferCount=0 with sequential
