@@ -152,6 +152,15 @@ namespace dxvk {
 
     /// Dispatch 3-pass motion-compensated framegen.
     /// Generates interpolated frame between current and saved previous.
+    /// Returns true when the Frame Generator has a valid VkDevice/VkQueue
+    /// and can actually dispatch. Callers should check this before entering
+    /// the FG evaluation path (analyzePerformance, tuneThreshold, needsFrameGen)
+    /// to avoid wasting CPU cycles on logging and threshold tuning that
+    /// cannot be acted upon.
+    static bool isFrameGenReady();
+
+    /// Dispatch 3-pass motion-compensated framegen.
+    /// Generates interpolated frame between current and saved previous.
     /// \param [in] curImage  Current rendered frame (VK_IMAGE_LAYOUT_GENERAL)
     /// \param [in] prevImage Previous frame (VK_IMAGE_LAYOUT_GENERAL)
     /// \param [in] extent    Image dimensions

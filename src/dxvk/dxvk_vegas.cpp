@@ -2052,6 +2052,11 @@ namespace dxvk {
     return s_fgOutputImage;
   }
 
+  /** Returns true if the Frame Generator has a valid VkDevice/VkQueue. */
+  bool Vegas::isFrameGenReady() {
+    return s_device != nullptr;
+  }
+
   /** Dispatch 3-pass motion-compensated framegen.
    *
    *  \param [in] curImage  Current rendered frame (VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)

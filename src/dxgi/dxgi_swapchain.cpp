@@ -349,7 +349,7 @@ namespace dxvk {
     auto now = dxvk::high_resolution_clock::now();
     float frameTime = std::chrono::duration<float, std::milli>(
         now - m_lastPresentTime).count();
-    if (m_presentId > 0 && frameTime > 0.0f && frameTime < 500.0f) {
+    if (Vegas::isFrameGenReady() && m_presentId > 0 && frameTime > 0.0f && frameTime < 500.0f) {
       double target = (m_frameRateLimit > 0.0) ? (1000.0 / m_frameRateLimit) : 16.667;
 
       m_lastPerfState = Vegas::analyzePerformance(
@@ -441,7 +441,7 @@ namespace dxvk {
 
     // --- VEGAS: FRAMEGEN DISPATCH (Tier 2-3, after FSR) ---
     // Uses the swapchain presentation image (index 1 if FSR ran, else index 0).
-    if (m_needsFrameGen && m_presenter != nullptr && m_presentId > 0) {
+    if (Vegas::isFrameGenReady() && m_needsFrameGen && m_presenter != nullptr && m_presentId > 0) {
       Com<IDXGIDXVKDevice> dxvkDevice;
       if (SUCCEEDED(m_presenter->GetDevice(__uuidof(IDXGIDXVKDevice),
               reinterpret_cast<void**>(&dxvkDevice)))) {
