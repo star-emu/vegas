@@ -7,15 +7,14 @@ permissions:
   actions: read
 
 jobs:
-  # ----------------------------------------------------------------
-  # Scavenge the latest successful build artifact from build.yml
-  # ----------------------------------------------------------------
-  scavenge:
+  build:
     runs-on: ubuntu-latest
-    outputs:
-      sha: ${{ steps.get-sha.outputs.sha }}
     steps:
-      - id: get-sha
+      - name: Install zstd
+        run: sudo apt-get update -y && sudo apt-get install -y zstd
+
+      - name: Get latest build SHA and run ID
+        id: get-sha
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -32,48 +31,26 @@ jobs:
           echo "sha=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Download artifact from build.yml
+      - name: Download build DLLs
         uses: actions/download-artifact@v4
         with:
           name: dxvk-${{ steps.get-sha.outputs.full_sha }}
-          path: ./dlls
+          path: ./workdir
           github-token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
           run-id: ${{ steps.get-sha.outputs.run_id }}
 
-      - name: Restructure for WCP packaging
+      - name: Restructure for WCP
         run: |
-          cd ./dlls
+          cd ./workdir
           VDIR="$(ls -d dxvk-*/)"
           mv "$VDIR/x64" ./
           mv "$VDIR/x32" ./
           rm -rf "$VDIR"
 
-      - name: Upload as vegas artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: vegas-${{ steps.get-sha.outputs.sha }}
-          path: ./dlls
-
-  # ----------------------------------------------------------------
-  # Package DLLs into Winlator Content Package (.wcp)
-  # ----------------------------------------------------------------
-  package-wcp:
-    needs: scavenge
-    runs-on: ubuntu-latest
-    steps:
-      - name: Install zstd
-        run: sudo apt-get update -y && sudo apt-get install -y zstd
-
-      - name: Download DLLs
-        uses: actions/download-artifact@v4
-        with:
-          name: vegas-${{ needs.scavenge.outputs.sha }}
-          path: ./dxvk
-
-      - name: Create WCP
+      - name: Package WCP
         run: |
-          cd ./dxvk
+          cd ./workdir
           mv x64 system32
           mv x32 syswow64
           cat > profile.json << 'JSONEOF'
@@ -95,11 +72,11 @@ jobs:
             ]
           }
           JSONEOF
-          tar --zstd -cf "../dxvk-2.7.3-vegas-${{ needs.scavenge.outputs.sha }}.wcp" \
+          tar --zstd -cf "../dxvk-2.7.3-vegas-${{ steps.get-sha.outputs.sha }}.wcp" \
             system32/ syswow64/ profile.json
 
       - name: Upload WCP
         uses: actions/upload-artifact@v4
         with:
-          name: wcp-${{ needs.scavenge.outputs.sha }}
+          name: wcp-${{ steps.get-sha.outputs.sha }}
           path: ./dxvk-*.wcp
