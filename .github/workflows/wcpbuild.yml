@@ -41,6 +41,14 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ steps.get-sha.outputs.run_id }}
 
+      - name: Restructure for WCP packaging
+        run: |
+          cd ./dlls
+          VDIR="$(ls -d dxvk-*/)"
+          mv "$VDIR/x64" ./
+          mv "$VDIR/x32" ./
+          rm -rf "$VDIR"
+
       - name: Upload as vegas artifact
         uses: actions/upload-artifact@v4
         with:
