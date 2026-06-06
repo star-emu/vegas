@@ -1,4 +1,4 @@
-name: Release (Experimental)
+name: WCP Build
 
 on:
   workflow_dispatch:
