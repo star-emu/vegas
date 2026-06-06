@@ -19,7 +19,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          RUN_JSON=$(gh run list --workflow build.yml --branch vegas \
+          RUN_JSON=$(gh run list --repo ${{ github.repository }} --workflow build.yml --branch vegas \
             --status success --limit 1 --json headSha,databaseId)
           if [ -z "$RUN_JSON" ] || [ "$RUN_JSON" = "[]" ]; then
             echo "::error::No successful build.yml runs found on branch vegas."
