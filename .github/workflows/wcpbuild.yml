@@ -16,6 +16,8 @@ jobs:
       sha: ${{ steps.get-sha.outputs.sha }}
     steps:
       - id: get-sha
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           RUN_JSON=$(gh run list --workflow build.yml --branch vegas \
             --status success --limit 1 --json headSha,databaseId)
