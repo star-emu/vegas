@@ -1,5 +1,7 @@
 #include "dxvk_swapchain_blitter.h"
 
+#include <memory>
+
 #include <dxvk_cursor_frag.h>
 #include <dxvk_cursor_vert.h>
 #include <dxvk_present_frag.h>
@@ -14,6 +16,7 @@ namespace dxvk {
     const Rc<DxvkDevice>& device,
     const Rc<hud::Hud>&   hud)
   : m_device(device), m_hud(hud),
+    m_vegasHud(std::make_unique<VegasHud>(device)),
     m_blitLayout(createBlitPipelineLayout()),
     m_cursorLayout(createCursorPipelineLayout()) {
     this->createSampler();
@@ -67,7 +70,7 @@ namespace dxvk {
     // If we can't do proper blending, render the HUD into a separate image
     bool composite = needsComposition(dstView);
 
-    if (m_hud && composite)
+    if ((m_hud || (m_vegasHud && m_vegasHud->isEnabled())) && composite)
       renderHudImage(ctx, dstView->mipLevelExtent(0));
     else
       destroyHudImage();
@@ -116,6 +119,9 @@ namespace dxvk {
     if (!composite) {
       if (m_hud)
         m_hud->render(ctx, dstView);
+
+      if (m_vegasHud && m_vegasHud->isEnabled())
+        m_vegasHud->render(ctx, dstView);
 
       if (m_cursorView)
         renderCursor(ctx, dstView);
@@ -378,7 +384,10 @@ namespace dxvk {
   void DxvkSwapchainBlitter::renderHudImage(
     const Rc<DxvkCommandList>&        ctx,
           VkExtent3D                  extent) {
-    if (m_hud->empty())
+    // Early out only if neither HUD has content
+    bool hudActive   = m_hud && !m_hud->empty();
+    bool vegasActive = m_vegasHud && m_vegasHud->isEnabled();
+    if (!hudActive && !vegasActive)
       return;
 
     if (!m_hudImage || m_hudImage->info().extent != extent)
@@ -423,7 +432,13 @@ namespace dxvk {
 
     ctx->cmdBeginRendering(&renderInfo);
 
-    m_hud->render(ctx, m_hudRtv);
+    // DXVK HUD items (top-left)
+    if (hudActive)
+      m_hud->render(ctx, m_hudRtv);
+
+    // VegasHud overlay (top-right)
+    if (vegasActive)
+      m_vegasHud->render(ctx, m_hudRtv);
 
     ctx->cmdEndRendering();
 

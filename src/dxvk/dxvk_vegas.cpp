@@ -74,6 +74,15 @@ namespace dxvk {
   uint32_t Vegas::s_fgMotionW         = 0;
   uint32_t Vegas::s_fgMotionH         = 0;
 
+  // VegasHud metrics
+  float    Vegas::s_ftHistory[FT_HISTORY_SIZE] = {};
+  uint32_t Vegas::s_ftHead             = 0;
+  float    Vegas::s_lastGpuLoad        = 0.0f;
+  VegasPerformanceState Vegas::s_lastPerfState = VegasPerformanceState::Normal;
+  float    Vegas::s_lastFrameTime      = 0.0f;
+  bool     Vegas::s_fsrActive          = false;
+  bool     Vegas::s_fgActive           = false;
+
 
 
   // ============================================================
@@ -2908,6 +2917,58 @@ namespace dxvk {
     Logger::debug(str::format("Vegas FG: dispatch complete (", extent.width, "x", extent.height, ")"));
     return true;
 
+  }
+
+  // ============================================================
+  // VegasHud metrics
+  // ============================================================
+  void Vegas::pushMetrics(
+          float                gpuLoad,
+          float                frameTime,
+          VegasPerformanceState state,
+          bool                 fsrActive,
+          bool                 fgActive) {
+    s_lastGpuLoad     = gpuLoad;
+    s_lastFrameTime   = frameTime;
+    s_lastPerfState   = state;
+    s_fsrActive       = fsrActive;
+    s_fgActive        = fgActive;
+
+    // Circular frame-time history
+    s_ftHistory[s_ftHead] = frameTime;
+    s_ftHead = (s_ftHead + 1) % FT_HISTORY_SIZE;
+  }
+
+  float Vegas::getHistoryFt(uint32_t idx) {
+    if (idx >= FT_HISTORY_SIZE)
+      return 0.0f;
+    // Index 0 = most recent, wraps backwards
+    uint32_t pos = (s_ftHead + FT_HISTORY_SIZE - 1 - idx) % FT_HISTORY_SIZE;
+    return s_ftHistory[pos];
+  }
+
+  uint32_t Vegas::getHistoryFtCount() {
+    return FT_HISTORY_SIZE;
+  }
+
+  float Vegas::getLastGpuLoad() {
+    return s_lastGpuLoad;
+  }
+
+  VegasPerformanceState Vegas::getLastPerfState() {
+    return s_lastPerfState;
+  }
+
+  float Vegas::getLastFrameTime() {
+    return s_lastFrameTime;
+  }
+
+  bool Vegas::isFsrActive() {
+    return s_fsrActive;
+  }
+
+  bool Vegas::isFgActive() {
+    return s_fgActive;
   }
 
 } // namespace dxvk

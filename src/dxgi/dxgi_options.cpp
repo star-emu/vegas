@@ -128,6 +128,7 @@ namespace dxvk {
     }
 
     this->vegasEnableUpscaler = config.getOption<Tristate>("vegas.enableUpscaler", Tristate::Auto);
+    this->vegasEnableHud      = config.getOption<Tristate>("vegas.enableHud",      Tristate::Auto);
   }
   
 }

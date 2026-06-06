@@ -1,10 +1,12 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <thread>
 #include <unordered_map>
 
 #include "./hud/dxvk_hud.h"
+#include "dxvk_vegas_hud.h"
 
 #include "../util/thread.h"
 
@@ -211,6 +213,7 @@ namespace dxvk {
 
     Rc<DxvkDevice>      m_device;
     Rc<hud::Hud>        m_hud;
+    std::unique_ptr<VegasHud> m_vegasHud;
 
     dxvk::mutex         m_mutex;
     Rc<DxvkBuffer>      m_gammaBuffer;

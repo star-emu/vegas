@@ -293,6 +293,33 @@ namespace dxvk {
     static uint64_t            s_fgOutputMemory;      ///< VkDeviceMemory
     static uint32_t            s_fgMotionW;           ///< motion buffer width (blocks)
     static uint32_t            s_fgMotionH;           ///< motion buffer height (blocks)
+
+    // ---- VegasHud metrics (updated by pushMetrics()) ----
+    static constexpr uint32_t  FT_HISTORY_SIZE = 60;
+    static float               s_ftHistory[FT_HISTORY_SIZE];
+    static uint32_t            s_ftHead;
+    static float               s_lastGpuLoad;
+    static VegasPerformanceState s_lastPerfState;
+    static float               s_lastFrameTime;
+    static bool                s_fsrActive;
+    static bool                s_fgActive;
+
+    /// Push frame-timing metrics for HUD consumption.
+    static void pushMetrics(
+            float                gpuLoad,
+            float                frameTime,
+            VegasPerformanceState state,
+            bool                 fsrActive,
+            bool                 fgActive);
+
+    /// Read frame time from circular history (relative index 0 = most recent).
+    static float getHistoryFt(uint32_t idx);
+    static uint32_t getHistoryFtCount();
+    static float getLastGpuLoad();
+    static VegasPerformanceState getLastPerfState();
+    static float getLastFrameTime();
+    static bool isFsrActive();
+    static bool isFgActive();
   };
 
 } // namespace dxvk

@@ -61,6 +61,7 @@ namespace dxvk {
 
     /// Vegas upscaler override
     Tristate vegasEnableUpscaler;
+    Tristate vegasEnableHud;
   };
   
 }

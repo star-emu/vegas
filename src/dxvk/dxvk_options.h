@@ -82,6 +82,10 @@ namespace dxvk {
     /// Only effective when enableStarProfile is not False.
     Tristate vegasEnableUpscaler = Tristate::Auto;
 
+    /// Enables VegasHud overlay (Auto/True/False)
+    /// Auto = enabled on Adreno when StarProfile is active.
+    Tristate vegasEnableHud = Tristate::Auto;
+
     /// Override GPU tier (0 = auto-detect, 1 = entry, 2 = mid, 3 = high).
     /// Forces the tier detected by the GPU-name classifier to this value.
     /// Useful for misclassified Adreno GPUs or manual tuning.

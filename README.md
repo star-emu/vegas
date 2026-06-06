@@ -65,6 +65,16 @@ Skips redundant `vkCmdBindPipeline` calls when no dynamic state has changed — 
 Graph coloring via `getGraphColor()`:
 `green` (normal) → `yellow` (lagging) → `orange` (stuttering) → `red` (overheating)
 
+### VegasHud Overlay (`vegas.enableHud`)
+Standalone dynamic overlay — independent of `DXVK_HUD`:
+- Always at **top-right**, always visible
+- Tier, GPU load, frame time, performance state
+- Active features (FSR, frame generation)
+- Numeric frame-time history (last 6 frames)
+- Color-coded by performance state (green/yellow/orange/red)
+
+Controlled by `vegas.enableHud = Auto | True | False`. Defaults to **Auto** (enabled on Adreno).
+
 ---
 
 ## Installation
@@ -75,10 +85,14 @@ Graph coloring via `getGraphColor()`:
 3. Install the `dxvk-2.7.3.wcp` package
 
 ### Manual (Winlator / Other)
-Place `dxvk.conf` in any of these paths:
+Place `vegas/dxvk.conf` (or the root `dxvk.conf`) in any of these paths:
 - `/storage/emulated/0/Winlator/`
 - `/storage/emulated/0/Download/`
 - `/storage/emulated/0/`
+
+The `vegas/` directory in this repo contains a clean, focused config file
+with all Vegas options pre-configured and documented. Copy it as `dxvk.conf`
+to one of the paths above.
 
 Or set `DXVK_CONFIG_FILE` to your config path.
 
@@ -90,6 +104,9 @@ Or set `DXVK_CONFIG_FILE` to your config path.
 # Master switch: Auto (Adreno only), True (force-on), False (force-off)
 dxvk.enableStarProfile = Auto
 
+# VegasHud overlay: Auto (default on Adreno), True, False
+vegas.enableHud = Auto
+
 # FSR 1.0 upscaler: Auto, True, False
 vegas.enableUpscaler = Auto
 
@@ -100,7 +117,7 @@ vegas.forceTier = 0
 dxvk.numCompilerThreads = 0
 ```
 
-All other parameters (thresholds, bind skip, HAAE pacing, quality scaling) are auto-tuned by the VEGAS engine.
+All other parameters (thresholds, bind skip, HAAE pacing, quality scaling) are auto-tuned by the VEGAS engine. For a complete config reference, see `vegas/dxvk.conf` in this repository.
 
 ---
 
@@ -125,6 +142,7 @@ The output DLLs (`d3d9.dll`, `d3d11.dll`, `dxgi.dll`, etc.) are placed in `/outp
 
 | Commit | Feature |
 |--------|---------|
+| `[current]` | **VegasHud:** standalone top-right overlay with `vegas.enableHud` config, tier/load/ft display, performance state colors, numeric FT history |
 | `bea5128` | **Bleeding-edge:** tier-based governor caps (1.5×/2.5×/3.0×), 15-frame cooldown, real GPU load from ftRatio, HAAE threshold fix (T1:50/T2:100/T3:150), ARM64 compiler thread cap (max 4) |
 | `1e2b208` | Remove per-shader zero-init log spam (3378 lines → 1 summary) |
 | `c99f219` | Respect `BufferCount ≥ 2` regardless of swap effect (fixes Tomb Raider DISCARD-mode) |
@@ -139,6 +157,7 @@ The output DLLs (`d3d9.dll`, `d3d11.dll`, `dxgi.dll`, etc.) are placed in `/outp
 ## Notes
 
 - **Tier 1 (Adreno 5xx/6xx low-end):** Frame generation disabled. FSR available but not recommended at very low resolutions.
+- **VegasHud:** The overlay (`vegas.enableHud`) is independent of `DXVK_HUD` — both can be active simultaneously without conflict.
 - **BCn→ASTC transcoder:** Implemented but deferred — the simplified encoder produces visual quality loss that outweighs the narrow benefit (only helps old Qualcomm blob, not Turnip). Available in code for future developers who want to integrate a proper encoder (e.g., `ispc_texcomp`).
 - **Turnip driver:** Use Mesa 25.x+ with Vulkan 1.3 support for descriptor indexing and push constants.
 - **Synthetic benchmarks:** May show lower FPS than stock due to draw thresholds. Judge performance by actual gameplay smoothness.

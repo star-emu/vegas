@@ -349,7 +349,15 @@ namespace dxvk {
     auto now = dxvk::high_resolution_clock::now();
     float frameTime = std::chrono::duration<float, std::milli>(
         now - m_lastPresentTime).count();
-    if (Vegas::isFrameGenReady() && m_presentId > 0 && frameTime > 0.0f && frameTime < 500.0f) {
+    bool   frameGenReady  = Vegas::isFrameGenReady();
+    bool   frameValid     = m_presentId > 0 && frameTime > 0.0f && frameTime < 500.0f;
+
+    // Default metrics (used when frameValid is false)
+    float gpuLoadEstimate = 0.0f;
+    float targetFt        = 16.667f;
+    bool  fsrActive       = false;
+
+    if (frameValid) {
       double target = (m_frameRateLimit > 0.0) ? (1000.0 / m_frameRateLimit) : 16.667;
 
       // Bleeding-edge: derive GPU load estimate from frame-time ratio.
@@ -359,10 +367,9 @@ namespace dxvk {
       //   0.9-1.2 → near capacity
       //   1.2-2.0 → saturated (GPU-bound)
       //   > 2.0  → overheating
-      float targetFt = static_cast<float>(target);
+      targetFt = static_cast<float>(target);
       float ftRatio = (targetFt > 0.0f) ? (frameTime / targetFt) : 1.0f;
 
-      float gpuLoadEstimate;
       if      (ftRatio > 2.0f) gpuLoadEstimate = 0.96f;
       else if (ftRatio > 1.5f) gpuLoadEstimate = 0.92f;
       else if (ftRatio > 1.2f) gpuLoadEstimate = 0.85f;
@@ -374,10 +381,11 @@ namespace dxvk {
           gpuLoadEstimate, frameTime,
           targetFt);
 
-      // Let the governor react to current conditions
-      Vegas::tuneThreshold(gpuLoadEstimate, frameTime);
+      // Let the governor react to current conditions (only when FG-ready)
+      if (frameGenReady)
+        Vegas::tuneThreshold(gpuLoadEstimate, frameTime);
 
-      m_needsFrameGen = Vegas::needsFrameGen(frameTime, Vegas::getTier());
+      m_needsFrameGen = frameGenReady && Vegas::needsFrameGen(frameTime, Vegas::getTier());
 
       Logger::debug(str::format(
           "Vegas: Perf=", Vegas::getStatusString(m_lastPerfState),
@@ -385,6 +393,8 @@ namespace dxvk {
           " load=", gpuLoadEstimate,
           " frameTime=", frameTime, "ms",
           " frameGen=", m_needsFrameGen ? "yes" : "no"));
+    } else {
+      m_needsFrameGen = false;
     }
     m_lastPresentTime = now;
     // --- END VEGAS ---
@@ -441,6 +451,8 @@ namespace dxvk {
                   dstInfo.format, fsrConsts);
               Logger::debug(str::format(
                   "Vegas FSR: ", dispatched ? "OK" : "SKIPPED/FAILED"));
+              if (dispatched)
+                fsrActive = true;
             }
           }
         }
@@ -480,6 +492,14 @@ namespace dxvk {
       }
     }
     // --- END VEGAS ---
+
+    // Push metrics for VegasHud (always, even if frame was invalid)
+    Vegas::pushMetrics(
+        frameValid ? gpuLoadEstimate : 0.0f,
+        frameValid ? frameTime : 0.0f,
+        m_lastPerfState,
+        fsrActive,
+        m_needsFrameGen);
 
     std::lock_guard<dxvk::recursive_mutex> lockWin(m_lockWindow);
     HRESULT hr = S_OK;
