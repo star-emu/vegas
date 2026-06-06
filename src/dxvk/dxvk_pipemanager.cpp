@@ -88,9 +88,18 @@ namespace dxvk {
       if (workerCount <  1) workerCount =  1;
       if (workerCount > 64) workerCount = 64;
 
-      // Reduce worker count on 32-bit to save adderss space
+      // Reduce worker count on 32-bit to save address space
       if (env::is32BitHostPlatform())
         workerCount = std::min(workerCount, 16u);
+
+      // Bleeding-edge: on ARM64 (Android/Turnip), cap auto-detected
+      // compiler threads to avoid CPU contention with the render thread
+      // on big.LITTLE CPUs. User override via dxvk.numCompilerThreads
+      // is still respected (checked below).
+#ifdef __aarch64__
+      if (m_device->config().numCompilerThreads <= 0)
+        workerCount = std::min(workerCount, 4u);
+#endif
 
       if (m_device->config().numCompilerThreads > 0)
         workerCount = m_device->config().numCompilerThreads;

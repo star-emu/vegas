@@ -173,19 +173,25 @@ namespace dxvk {
 
   // VEGAS: Governor-style tiered threshold (AdrenoGovernor logic)
   //
-  // TBDR-safe design:
-  //   - Caps at 2× base threshold to prevent tile-buffer overflow
+  // Bleeding-edge tier-aware design:
+  //   - Tier 1 (entry):  conservative 1.5× cap — TBDR tile overflow protection
+  //   - Tier 2 (mid):    balanced 2.5× cap
+  //   - Tier 3 (high):   aggressive 3.0× cap — high-end can batch deeper
   //   - Resets to base on moderate load to prevent sticky high thresholds
   //   - Low-load path requires sustained frame time > 8 ms (avoids transient spikes)
   void Vegas::tuneThreshold(uint32_t& threshold, float load, float frameTime, uint32_t tier) {
       static constexpr uint32_t baseThresholds[] = { 600, 1200, 2000 };
       uint32_t base = (tier >= 1 && tier <= 3) ? baseThresholds[tier - 1] : 600;
-      uint32_t cap  = base * 2;  // TBDR safety limit
+
+      // Tier-based cap multiplier
+      static constexpr float capMultipliers[] = { 1.5f, 2.5f, 3.0f };
+      float multiplier = (tier >= 1 && tier <= 3) ? capMultipliers[tier - 1] : 1.5f;
+      uint32_t cap = static_cast<uint32_t>(base * multiplier);
 
       if ((load > 0.90f && frameTime > 25.0f) ||
           (load < 0.60f && frameTime > 8.0f)) {
           // High sustained load (GPU-bound) or low sustained load (headroom):
-          // allow up to 2× batching to amortise flush overhead
+          // raise threshold to amortise flush overhead
           threshold = cap;
       } else {
           // Moderate load — reset to base to prevent sticky high thresholds
@@ -200,11 +206,12 @@ namespace dxvk {
       thread_local float s_smoothFt = 16.6f;
       s_smoothFt = s_smoothFt * 0.9f + frameTime * 0.1f;
 
-      // 2. Frame-count cooldown — re-evaluate at most once every 30 calls
-      //    (~0.5 seconds at 60 fps, ~1 second at 30 fps).
+      // 2. Frame-count cooldown — re-evaluate at most once every 15 calls
+      //    (~250 ms at 60 fps, ~500 ms at 30 fps).
+      //    Reduced from 30 → 15 for faster governor response.
       thread_local uint32_t s_framesSinceAdj = 0;
       s_framesSinceAdj++;
-      if (s_framesSinceAdj < 30)
+      if (s_framesSinceAdj < 15)
           return;
       s_framesSinceAdj = 0;
 
@@ -951,7 +958,10 @@ namespace dxvk {
 
     // Bake draw thresholds based on GPU tier (D3D11 base)
     static constexpr uint32_t drawThresholdTable[] = { 600, 1200, 2000 };
-    static constexpr uint32_t haaeThresholdTable[] = { 150, 65,   100 };
+    // Bleeding-edge: inverted HAAE thresholds fixed.
+    // Tier 1 (low-end) needs MORE frequent pacing (lower threshold)
+    // to prevent GPU overwhelm. Tier 3 (high-end) can batch longer.
+    static constexpr uint32_t haaeThresholdTable[] = { 50, 100, 150 };
 
     uint32_t idx = (s_tier >= 1 && s_tier <= 3) ? s_tier - 1 : 0;
     s_drawThreshold = drawThresholdTable[idx];

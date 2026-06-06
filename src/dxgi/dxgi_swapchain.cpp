@@ -352,21 +352,27 @@ namespace dxvk {
     if (Vegas::isFrameGenReady() && m_presentId > 0 && frameTime > 0.0f && frameTime < 500.0f) {
       double target = (m_frameRateLimit > 0.0) ? (1000.0 / m_frameRateLimit) : 16.667;
 
-      m_lastPerfState = Vegas::analyzePerformance(
-          0.5f, frameTime,              // 0.5 is only used for Overheating check
-          static_cast<float>(target));
+      // Bleeding-edge: derive GPU load estimate from frame-time ratio.
+      // frameTime / targetFT gives real utilization:
+      //   < 0.5  → GPU has lots of headroom (CPU-bound)
+      //   0.5-0.9 → some headroom
+      //   0.9-1.2 → near capacity
+      //   1.2-2.0 → saturated (GPU-bound)
+      //   > 2.0  → overheating
+      float targetFt = static_cast<float>(target);
+      float ftRatio = (targetFt > 0.0f) ? (frameTime / targetFt) : 1.0f;
 
-      // Derive GPU load estimate from performance state.
-      // Without real Vulkan query data this is a heuristic, but it's
-      // vastly better than the hardcoded 0.5 which always hit the
-      // "low load → raise threshold" branch and pegged it at 8000.
       float gpuLoadEstimate;
-      switch (m_lastPerfState) {
-        case VegasPerformanceState::Overheating: gpuLoadEstimate = 0.96f; break;
-        case VegasPerformanceState::Stuttering:
-        case VegasPerformanceState::Lagging:     gpuLoadEstimate = 0.92f; break;
-        default:                                 gpuLoadEstimate = 0.50f; break;
-      }
+      if      (ftRatio > 2.0f) gpuLoadEstimate = 0.96f;
+      else if (ftRatio > 1.5f) gpuLoadEstimate = 0.92f;
+      else if (ftRatio > 1.2f) gpuLoadEstimate = 0.85f;
+      else if (ftRatio > 0.9f) gpuLoadEstimate = 0.65f;
+      else if (ftRatio > 0.5f) gpuLoadEstimate = 0.40f;
+      else                      gpuLoadEstimate = 0.25f;
+
+      m_lastPerfState = Vegas::analyzePerformance(
+          gpuLoadEstimate, frameTime,
+          targetFt);
 
       // Let the governor react to current conditions
       Vegas::tuneThreshold(gpuLoadEstimate, frameTime);
@@ -375,6 +381,8 @@ namespace dxvk {
 
       Logger::debug(str::format(
           "Vegas: Perf=", Vegas::getStatusString(m_lastPerfState),
+          " ftRatio=", ftRatio,
+          " load=", gpuLoadEstimate,
           " frameTime=", frameTime, "ms",
           " frameGen=", m_needsFrameGen ? "yes" : "no"));
     }

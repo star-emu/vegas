@@ -45,7 +45,7 @@ Available on Tier 2 (≤29ms frametime) and Tier 3 (≤33ms frametime):
 Compute-only pipeline with shared 4-binding descriptor layout.
 
 ### 🛡️ Adaptive Governor (`tuneThreshold`)
-EMA-smoothed frame-time telemetry with 120-frame cooldown prevents threshold oscillation. Automatically adjusts mid-frame flush threshold based on GPU load.
+EMA-smoothed frame-time telemetry with **15-frame cooldown** (down from 120) provides 8× faster governor response. Tier-based cap multipliers (T1=1.5×, T2=2.5×, T3=3.0×) ensure optimal batching for each GPU class. Real GPU load is estimated from `frameTime/targetFrameTime` ratio (6 continuous levels from 0.25 to 0.96) rather than a hardcoded value, enabling accurate overheating detection.
 
 ### 📊 Dynamic VRAM & GPU Mask
 - `applyVramSwap(Config&)` — Sets `dxgi.maxDeviceMemory` to 40% of system RAM (clamped 1–4 GB)
@@ -111,6 +111,10 @@ See the [Upstream DXVK Documentation](#upstream-dxvk-documentation) section belo
 
 | Commit | Feature |
 |--------|---------|
+| `5b7bcd5` | **Bleeding-edge:** tier-based governor caps (1.5×/2.5×/3.0×), 15-frame cooldown, real GPU load via ftRatio, HAAE threshold fix, ARM64 compiler thread cap (max 4) |
+| `a8c994e` | **Phase 1/2:** Custom tier classifier (classifyAdrenoTier), TBDR-safe governor, 60s shader cache flush, swapchain BufferCount fix, async+GPL compat, zero-init tier-aware, log cleanup (3378→1 line) |
+| `1fe8861` | GPL disabled when async pipeline compilation is active |
+| `1346828` | Respect BufferCount ≥2 regardless of swap effect (fixes Tomb Raider DISCARD mode) |
 | `c7be5c3` | Master switch + dead code removal + conf docs |
 | `c006dc3` | Framegen first-frame dead code fix |
 | `7da716a` | 3-pass framegen integration |
@@ -125,6 +129,7 @@ See the [Upstream DXVK Documentation](#upstream-dxvk-documentation) section belo
 - **BCn→ASTC transcoder:** Implemented but gated — will be enabled when image upload pipeline is wired.
 - **Turnip driver:** Use a recent Turnip (Mesa 25.x+) for best results. The Vulkan 1.3 path is required for descriptor indexing and push constants.
 - **Container tests:** Built-in benchmarks may show lower FPS due to draw thresholds. Judge by actual gameplay smoothness.
+- **CHANGES_AND_FIXES.txt:** See the companion file for a complete, game-by-game breakdown of all stability and performance fixes.
 
 ---
 
