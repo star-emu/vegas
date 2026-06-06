@@ -139,7 +139,7 @@ The output DLLs (`d3d9.dll`, `d3d11.dll`, `dxgi.dll`, etc.) are placed in `/outp
 ## Notes
 
 - **Tier 1 (Adreno 5xx/6xx low-end):** Frame generation disabled. FSR available but not recommended at very low resolutions.
-- **BCn→ASTC transcoder:** Implemented but gated — requires image upload pipeline wiring and block-size alignment validation.
+- **BCn→ASTC transcoder:** Implemented but deferred — the simplified encoder produces visual quality loss that outweighs the narrow benefit (only helps old Qualcomm blob, not Turnip). Available in code for future developers who want to integrate a proper encoder (e.g., `ispc_texcomp`).
 - **Turnip driver:** Use Mesa 25.x+ with Vulkan 1.3 support for descriptor indexing and push constants.
 - **Synthetic benchmarks:** May show lower FPS than stock due to draw thresholds. Judge performance by actual gameplay smoothness.
 - **GPU-bound workloads:** VSync-off provides negligible gain when the GPU is already saturated (17+ ms frame times).
