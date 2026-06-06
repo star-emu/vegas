@@ -10,6 +10,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Install zstd
         run: sudo apt-get update -y && sudo apt-get install -y zstd
 
@@ -80,3 +84,9 @@ jobs:
         with:
           name: wcp-${{ steps.get-sha.outputs.sha }}
           path: ./dxvk-*.wcp
+
+      - name: Upload vegas config
+        uses: actions/upload-artifact@v4
+        with:
+          name: vegas-config-${{ steps.get-sha.outputs.sha }}
+          path: vegas/
