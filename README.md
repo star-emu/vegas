@@ -1,7 +1,7 @@
 <p align="center">
   <img alt="VEGAS" src="./vegas_banner.gif" width="80%">
   <br>
-  <em>Gold border glow and sparkle particles animate on loop</em>
+  <em>star engine rebased and rebranded; vegas</em>
 </p>
 
 # VEGAS — DXVK v2.7.3
