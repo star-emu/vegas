@@ -1,7 +1,8 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/495a3b98-5328-4aae-8d2e-2a6656dda567">
-  <img alt="VEGAS" src="https://github.com/user-attachments/assets/495a3b98-5328-4aae-8d2e-2a6656dda567" width="80%">
-</picture>
+<p align="center">
+  <img alt="VEGAS" src="./vegas_banner.gif" width="80%">
+  <br>
+  <em>Gold border glow and sparkle particles animate on loop</em>
+</p>
 
 # VEGAS — DXVK v2.7.3
 ### Adreno-Tuned DXVK for Android Emulation (Star Emulator / Winlator)
