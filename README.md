@@ -147,7 +147,7 @@ The output DLLs (`d3d9.dll`, `d3d11.dll`, `dxgi.dll`, etc.) are placed in `/outp
 
 ## Credits
 
-- **Lead Developer:** AGBOOLA ISRAEL OLUWAGBOGO
+- **Lead Developer:** isygold
 - **Base Project:** DXVK v2.7.1+ by doitsujin
 - **License:** zlib/libpng
 
