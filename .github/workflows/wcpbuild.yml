@@ -4,9 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
   actions: read
-  metadata: read
 
 jobs:
   # ----------------------------------------------------------------
@@ -19,25 +17,18 @@ jobs:
     steps:
       - id: get-sha
         run: |
-          API=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build.yml/runs?branch=vegas&status=success&per_page=1")
-          echo "$API" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-if 'workflow_runs' not in d:
-    print('::error::GitHub API returned no workflow_runs key. Response follows:')
-    print('::error::' + json.dumps(d, indent=2)[:500])
-    sys.exit(1)
-runs = d['workflow_runs']
-if not runs:
-    print('::error::No successful build.yml runs found on branch vegas.')
-    print('::error::Trigger a Build DXVK (x64 + x32) workflow first.')
-    sys.exit(1)
-r = runs[0]
-print(f'full_sha={r[\"head_sha\"]}')
-print(f'sha={r[\"head_sha\"][:7]}')
-print(f'run_id={r[\"id\"]}')
-" >> "$GITHUB_OUTPUT"
+          RUN_JSON=$(gh run list --workflow build.yml --branch vegas \
+            --status success --limit 1 --json headSha,databaseId)
+          if [ -z "$RUN_JSON" ] || [ "$RUN_JSON" = "[]" ]; then
+            echo "::error::No successful build.yml runs found on branch vegas."
+            echo "::error::Trigger a Build DXVK (x64 + x32) workflow first."
+            exit 1
+          fi
+          FULL_SHA=$(echo "$RUN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['headSha'])")
+          RUN_ID=$(echo "$RUN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['databaseId'])")
+          echo "full_sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
+          echo "sha=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
       - name: Download artifact from build.yml
         uses: actions/download-artifact@v4
