@@ -415,10 +415,12 @@ namespace dxvk {
         }
 
         m_prevGpuIdleTicks = currGpuIdleTicks;
-        m_gpuLoadValid = true;
       }
 
-      // Fallback (first frame or device unavailable): ftRatio-based proxy
+      // Fallback (first frame or device unavailable): ftRatio-based proxy.
+      // m_gpuLoadValid is set to true here (not in the gpuIdleTicks block)
+      // so the ftRatio fallback still runs on frame 1 when gpuIdleTicks
+      // has no previous tick to compute a delta from.
       if (!m_gpuLoadValid) {
         float ftRatio = (targetFt > 0.0f) ? (frameTime / targetFt) : 1.0f;
         if      (ftRatio > 2.0f) gpuLoadEstimate = 0.96f;
@@ -427,6 +429,9 @@ namespace dxvk {
         else if (ftRatio > 0.9f) gpuLoadEstimate = 0.65f;
         else if (ftRatio > 0.5f) gpuLoadEstimate = 0.40f;
         else                      gpuLoadEstimate = 0.25f;
+
+        // Mark valid AFTER ftRatio fallback so frame 2+ use real gpuIdleTicks
+        m_gpuLoadValid = true;
       }
 
       m_lastPerfState = Vegas::analyzePerformance(

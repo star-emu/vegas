@@ -211,10 +211,11 @@ namespace dxvk {
           }
         }
         m_prevGpuIdleTicks = currGpuIdleTicks;
-        m_gpuLoadValid = true;
       }
 
-      // ftRatio fallback
+      // ftRatio fallback (first frame: no previous tick yet, so use ratio).
+      // After ftRatio sets a baseline, m_gpuLoadValid becomes true and
+      // subsequent frames use real gpuIdleTicks delta instead.
       if (!m_gpuLoadValid) {
         float targetFt = (m_targetFrameRate > 0.0)
             ? static_cast<float>(1000.0 / m_targetFrameRate)
@@ -226,6 +227,9 @@ namespace dxvk {
         else if (ftRatio > 0.9f) gpuLoadEstimate = 0.65f;
         else if (ftRatio > 0.5f) gpuLoadEstimate = 0.40f;
         else                      gpuLoadEstimate = 0.25f;
+
+        // Mark valid so next frame uses real gpuIdleTicks delta
+        m_gpuLoadValid = true;
       }
 
       m_lastPerfState = Vegas::analyzePerformance(
