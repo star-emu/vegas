@@ -3,6 +3,7 @@
 #include "dxgi_swapchain.h"
 
 #include "../util/util_misc.h"
+#include "../dxvk/dxvk_device.h"
 #include "../dxvk/dxvk_vegas.h"
 
 #include <d3d12.h>
@@ -359,23 +360,48 @@ namespace dxvk {
 
     if (frameValid) {
       double target = (m_frameRateLimit > 0.0) ? (1000.0 / m_frameRateLimit) : 16.667;
-
-      // Bleeding-edge: derive GPU load estimate from frame-time ratio.
-      // frameTime / targetFT gives real utilization:
-      //   < 0.5  → GPU has lots of headroom (CPU-bound)
-      //   0.5-0.9 → some headroom
-      //   0.9-1.2 → near capacity
-      //   1.2-2.0 → saturated (GPU-bound)
-      //   > 2.0  → overheating
       targetFt = static_cast<float>(target);
-      float ftRatio = (targetFt > 0.0f) ? (frameTime / targetFt) : 1.0f;
 
-      if      (ftRatio > 2.0f) gpuLoadEstimate = 0.96f;
-      else if (ftRatio > 1.5f) gpuLoadEstimate = 0.92f;
-      else if (ftRatio > 1.2f) gpuLoadEstimate = 0.85f;
-      else if (ftRatio > 0.9f) gpuLoadEstimate = 0.65f;
-      else if (ftRatio > 0.5f) gpuLoadEstimate = 0.40f;
-      else                      gpuLoadEstimate = 0.25f;
+      // Fix 3: Real GPU load from gpuIdleTicks delta.
+      //   Replaces the old ftRatio-based proxy with true GPU idle
+      //   accumulation from the submission queue. Follows the same
+      //   pattern as DXVK's built-in HudGpuLoadItem.
+      //
+      //   gpuLoad = (wallTime - gpuIdleTime) / wallTime
+      //
+      //   Falls back to ftRatio proxy when device stats are unavailable
+      //   (first frame, or s_dxvkDevice not yet initialized).
+      if (Vegas::s_dxvkDevice != nullptr) {
+        DxvkStatCounters counters = Vegas::s_dxvkDevice->getStatCounters();
+        uint64_t currGpuIdleTicks = counters.getCtr(DxvkStatCounter::GpuIdleTicks);
+
+        if (m_gpuLoadValid) {
+          uint64_t diffIdle = currGpuIdleTicks - m_prevGpuIdleTicks;
+          uint64_t wallUs   = static_cast<uint64_t>(frameTime * 1000.0f);  // ms → μs
+
+          if (wallUs > 0) {
+            uint64_t busyUs  = (wallUs > diffIdle) ? (wallUs - diffIdle) : 0u;
+            gpuLoadEstimate = std::min(
+                static_cast<float>(busyUs) / static_cast<float>(wallUs), 1.0f);
+          } else {
+            gpuLoadEstimate = 0.0f;
+          }
+        }
+
+        m_prevGpuIdleTicks = currGpuIdleTicks;
+        m_gpuLoadValid = true;
+      }
+
+      // Fallback (first frame or device unavailable): ftRatio-based proxy
+      if (!m_gpuLoadValid) {
+        float ftRatio = (targetFt > 0.0f) ? (frameTime / targetFt) : 1.0f;
+        if      (ftRatio > 2.0f) gpuLoadEstimate = 0.96f;
+        else if (ftRatio > 1.5f) gpuLoadEstimate = 0.92f;
+        else if (ftRatio > 1.2f) gpuLoadEstimate = 0.85f;
+        else if (ftRatio > 0.9f) gpuLoadEstimate = 0.65f;
+        else if (ftRatio > 0.5f) gpuLoadEstimate = 0.40f;
+        else                      gpuLoadEstimate = 0.25f;
+      }
 
       m_lastPerfState = Vegas::analyzePerformance(
           gpuLoadEstimate, frameTime,
@@ -389,9 +415,9 @@ namespace dxvk {
 
       Logger::debug(str::format(
           "Vegas: Perf=", Vegas::getStatusString(m_lastPerfState),
-          " ftRatio=", ftRatio,
           " load=", gpuLoadEstimate,
           " frameTime=", frameTime, "ms",
+          " ftRatio=", (targetFt > 0.0f) ? (frameTime / targetFt) : 1.0f,
           " frameGen=", m_needsFrameGen ? "yes" : "no"));
     } else {
       m_needsFrameGen = false;

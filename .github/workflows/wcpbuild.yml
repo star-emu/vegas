@@ -62,7 +62,7 @@ jobs:
           {
             "type": "DXVK",
             "versionName": "2.7.3-vegas",
-            "versionCode": 0,
+            "versionCode": 1,
             "description": "VEGAS — Community DXVK fork optimized for Android/Winlator",
             "files": [
               {"source": "system32/d3d9.dll",      "target": "${system32}/d3d9.dll"},

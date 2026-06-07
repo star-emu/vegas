@@ -209,6 +209,10 @@ namespace dxvk {
     float                                    m_aspectRatioX = 1.0f;
     float                                    m_aspectRatioY = 1.0f;
 
+    // Real GPU load from gpuIdleTicks delta (Fix 3)
+    uint64_t                                 m_prevGpuIdleTicks = 0;
+    bool                                     m_gpuLoadValid = false;
+
     DXGI_COLOR_SPACE_TYPE           m_colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
 
     uint32_t                        m_globalHDRStateSerial = 0;

@@ -52,6 +52,10 @@ namespace dxvk {
     constexpr int32_t fontSz  = 14;
     constexpr int32_t lineH   = 17;  // line height in pixels
     constexpr int32_t margin  = 8;   // right margin from edge
+    // Character advance in pixels at fontSz=14:
+    // advance = (fontSz / g_hudFont.size) * g_hudFont.advance
+    //         = (14.0f / 32.0f) * 24.0f = 10.5f
+    constexpr float   charAdvance = 10.5f;
     int32_t x = w - margin;          // right-aligned column
     int32_t y = 8;                    // start from top
 
@@ -60,7 +64,7 @@ namespace dxvk {
     // ----------------------------------------------------------------
     {
       std::string header = "VEGAS v1.0";
-      x -= static_cast<int32_t>(header.size()) * 8; // approx char width
+      x -= static_cast<int32_t>(header.size() * charAdvance);
       m_renderer.drawText(fontSz, { x, y }, COLOR_HEADER, header);
     }
 
@@ -80,7 +84,7 @@ namespace dxvk {
       std::snprintf(ftBuf, sizeof(ftBuf), "%.1fms", static_cast<double>(ft));
 
       std::string line = tierStr + "  " + loadStr + "  " + ftBuf;
-      x = w - margin - static_cast<int32_t>(line.size()) * 8;
+      x = w - margin - static_cast<int32_t>(line.size() * charAdvance);
 
       // Pick color based on performance state
       uint32_t color = COLOR_WHITE;
@@ -115,7 +119,7 @@ namespace dxvk {
         default: color = COLOR_DIM; break;
       }
 
-      x = w - margin - static_cast<int32_t>(line.size()) * 8;
+      x = w - margin - static_cast<int32_t>(line.size() * charAdvance);
       m_renderer.drawText(fontSz, { x, y }, color, line);
     }
 
@@ -136,9 +140,70 @@ namespace dxvk {
         ftLine += buf;
       }
 
-      x = w - margin - static_cast<int32_t>(ftLine.size()) * 8;
+      x = w - margin - static_cast<int32_t>(ftLine.size() * charAdvance);
       if (ftLine.size() > 3) // "FT:" minimum
         m_renderer.drawText(fontSz, { x, y }, COLOR_HIST, ftLine);
+    }
+
+    // ----------------------------------------------------------------
+    // Frame Time Bar Graph (compact ASCII bar chart)
+    //
+    // Renders the last N frame times as a right-aligned bar chart.
+    // Each bar is one column of characters; height encodes magnitude.
+    // Color encoding via character choice:
+    //   '#'  — normal  (<16.67ms)
+    //   '@'  — warning (16.67-33.33ms)
+    //   '!'  — critical (>33.33ms)
+    // ----------------------------------------------------------------
+    {
+      constexpr uint32_t GRAPH_BARS   = 20;
+      constexpr uint32_t GRAPH_LEVELS = 4;
+      constexpr float    GRAPH_CEIL   = 50.0f;
+
+      // Collect bar heights from the circular history
+      uint32_t barHeights[GRAPH_BARS];
+      float    barTimes[GRAPH_BARS];
+
+      for (uint32_t i = 0; i < GRAPH_BARS; i++) {
+        float ft = Vegas::getHistoryFt(i);
+        barTimes[i] = ft;
+        if (ft <= 0.0f || ft > 500.0f) {
+          barHeights[i] = 0;
+          continue;
+        }
+        uint32_t h = static_cast<uint32_t>((ft / GRAPH_CEIL) * GRAPH_LEVELS);
+        barHeights[i] = std::min(h, GRAPH_LEVELS);
+      }
+
+      // Position graph below the numeric FT line
+      y += lineH + 2;
+      int32_t graphBaseY = y + 2;
+
+      // Render each horizontal level from bottom (0) to top (N-1).
+      // Level 0 = lowest values (0-12.5ms), Level 3 = highest (37.5-50ms).
+      for (uint32_t level = 0; level < GRAPH_LEVELS; level++) {
+        std::string row(GRAPH_BARS, ' ');
+
+        for (uint32_t bar = 0; bar < GRAPH_BARS; bar++) {
+          if (barHeights[bar] > level) {
+            float ft = barTimes[bar];
+            if (ft > 33.33f)
+              row[bar] = '!';   // critical — red tier
+            else if (ft > 16.67f)
+              row[bar] = '@';   // warning  — amber tier
+            else
+              row[bar] = '#';   // normal   — green tier
+          }
+        }
+
+        // Right-align each row
+        int32_t rowX = w - margin
+                     - static_cast<int32_t>(row.size() * charAdvance);
+        int32_t rowY = graphBaseY
+                     + static_cast<int32_t>(GRAPH_LEVELS - 1 - level) * lineH;
+
+        m_renderer.drawText(fontSz, { rowX, rowY }, COLOR_HIST, row);
+      }
     }
 
     // Flush all queued text draws
