@@ -898,6 +898,8 @@ namespace dxvk {
 
     UINT STDMETHODCALLTYPE GetAPIVersion();
 
+    void* STDMETHODCALLTYPE GetDXVKDevice();
+
   private:
 
     D3D11DXGIDevice* m_container;

@@ -3763,9 +3763,13 @@ namespace dxvk {
     return m_apiVersion;
   }
 
+
+  void* STDMETHODCALLTYPE DXGIDXVKDevice::GetDXVKDevice() {
+    return m_container->GetDXVKDevice().ptr();
+  }
+
+
   
-
-
   D3D11DXGIDevice::D3D11DXGIDevice(
           IDXGIAdapter*       pAdapter,
           ID3D12Device*       pD3D12Device,

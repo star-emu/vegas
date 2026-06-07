@@ -1034,6 +1034,12 @@ namespace dxvk {
     s_device          = reinterpret_cast<void*>(device->handle());
     s_physicalDevice  = reinterpret_cast<uint64_t>(device->adapter()->handle());
 
+    // Store tier in shared DxvkDevice metrics for cross-DLL access
+    if (device != nullptr) {
+      device->m_vegasMetrics.tier        = s_tier;
+      device->m_vegasMetrics.initialized = true;
+    }
+
     s_initialized = true;
   }
 
@@ -1041,7 +1047,14 @@ namespace dxvk {
   bool Vegas::isBindSkipEnabled()   { return s_bindSkipEnabled; }
   uint32_t Vegas::getDrawThreshold() { return s_drawThreshold; }
   uint32_t Vegas::getHaaeThreshold() { return s_haaeThreshold; }
-  uint32_t Vegas::getTier()         { return s_tier; }
+  uint32_t Vegas::getTier()         {
+    // Prefer shared device metrics (cross-DLL safe)
+    auto dev = s_dxvkDevice;
+    if (dev != nullptr && dev->m_vegasMetrics.initialized
+        && dev->m_vegasMetrics.tier != 0)
+      return dev->m_vegasMetrics.tier;
+    return s_tier;
+  }
 
   // ============================================================
   // Decision Helpers — all feature logic lives here
@@ -3610,21 +3623,44 @@ namespace dxvk {
           VegasPerformanceState state,
           bool                 fsrActive,
           bool                 fgActive) {
+    // Always write to static vars for backward compat
     s_lastGpuLoad     = gpuLoad;
     s_lastFrameTime   = frameTime;
     s_lastPerfState   = state;
     s_fsrActive       = fsrActive;
     s_fgActive        = fgActive;
 
-    // Circular frame-time history
     s_ftHistory[s_ftHead] = frameTime;
     s_ftHead = (s_ftHead + 1) % FT_HISTORY_SIZE;
+
+    // Also write to shared DxvkDevice metrics (cross-DLL safe).
+    // The device object is the same pointer in both d3d11.dll and
+    // dxgi.dll, so metrics written by PresentBase (dxgi.dll) are
+    // visible to VegasHud (d3d11.dll).
+    auto dev = s_dxvkDevice;
+    if (dev != nullptr && dev->m_vegasMetrics.initialized) {
+      dev->m_vegasMetrics.gpuLoad    = gpuLoad;
+      dev->m_vegasMetrics.frameTime  = frameTime;
+      dev->m_vegasMetrics.perfState  = static_cast<uint32_t>(state);
+      dev->m_vegasMetrics.fsrActive  = fsrActive;
+      dev->m_vegasMetrics.fgActive   = fgActive;
+      dev->m_vegasMetrics.ftHistory[dev->m_vegasMetrics.ftHead] = frameTime;
+      dev->m_vegasMetrics.ftHead = (dev->m_vegasMetrics.ftHead + 1) % FT_HISTORY_SIZE;
+    }
   }
 
   float Vegas::getHistoryFt(uint32_t idx) {
     if (idx >= FT_HISTORY_SIZE)
       return 0.0f;
-    // Index 0 = most recent, wraps backwards
+
+    // Prefer shared device metrics (cross-DLL safe)
+    auto dev = s_dxvkDevice;
+    if (dev != nullptr && dev->m_vegasMetrics.initialized) {
+      uint32_t pos = (dev->m_vegasMetrics.ftHead + FT_HISTORY_SIZE - 1 - idx) % FT_HISTORY_SIZE;
+      return dev->m_vegasMetrics.ftHistory[pos];
+    }
+
+    // Fallback to per-DLL static
     uint32_t pos = (s_ftHead + FT_HISTORY_SIZE - 1 - idx) % FT_HISTORY_SIZE;
     return s_ftHistory[pos];
   }
@@ -3634,22 +3670,37 @@ namespace dxvk {
   }
 
   float Vegas::getLastGpuLoad() {
+    auto dev = s_dxvkDevice;
+    if (dev != nullptr && dev->m_vegasMetrics.initialized)
+      return dev->m_vegasMetrics.gpuLoad;
     return s_lastGpuLoad;
   }
 
   VegasPerformanceState Vegas::getLastPerfState() {
+    auto dev = s_dxvkDevice;
+    if (dev != nullptr && dev->m_vegasMetrics.initialized)
+      return static_cast<VegasPerformanceState>(dev->m_vegasMetrics.perfState);
     return s_lastPerfState;
   }
 
   float Vegas::getLastFrameTime() {
+    auto dev = s_dxvkDevice;
+    if (dev != nullptr && dev->m_vegasMetrics.initialized)
+      return dev->m_vegasMetrics.frameTime;
     return s_lastFrameTime;
   }
 
   bool Vegas::isFsrActive() {
+    auto dev = s_dxvkDevice;
+    if (dev != nullptr && dev->m_vegasMetrics.initialized)
+      return dev->m_vegasMetrics.fsrActive;
     return s_fsrActive;
   }
 
   bool Vegas::isFgActive() {
+    auto dev = s_dxvkDevice;
+    if (dev != nullptr && dev->m_vegasMetrics.initialized)
+      return dev->m_vegasMetrics.fgActive;
     return s_fgActive;
   }
 

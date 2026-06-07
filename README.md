@@ -96,12 +96,24 @@ Controlled by `vegas.enableHud = Auto | True | False`. Defaults to **Auto** (ena
 
 ## Installation
 
+### WCP Package Types
+Each release provides **two** WCP packages with identical DLLs but different metadata:
+
+| Package | `type` field | For |
+|---------|-------------|-----|
+| `dxvk-2.7.3-vegas-*.wcp` | `"DXVK"` | **Stock Winlator** and general Android DXVK use |
+| `vegas-2.7.3-*.wcp` | `"VEGAS"` | **Star Emulator** (latest build) |
+
 ### Via Star Emulator
 1. Open Star Emulator
 2. Go to **Contents** menu
-3. Install the `dxvk-2.7.3.wcp` package
+3. Install the `vegas-2.7.3-*.wcp` package (VEGAS-native type)
 
-### Manual (Winlator / Other)
+### Via Stock Winlator
+1. Download the `dxvk-2.7.3-vegas-*.wcp` package
+2. Install it as a standard DXVK WCP package in Winlator
+
+### Manual Configuration
 Place `vegas/dxvk.conf` (or the root `dxvk.conf`) in any of these paths:
 - `/storage/emulated/0/Winlator/`
 - `/storage/emulated/0/Download/`

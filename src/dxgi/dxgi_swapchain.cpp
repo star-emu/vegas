@@ -362,6 +362,32 @@ namespace dxvk {
       double target = (m_frameRateLimit > 0.0) ? (1000.0 / m_frameRateLimit) : 16.667;
       targetFt = static_cast<float>(target);
 
+      // Lazy init: resolve DxvkDevice pointer from the presenter for
+      // cross-DLL metrics sharing. In dxgi.dll, Vegas::s_dxvkDevice is
+      // NULL because initializeProfile() only runs in d3d11.dll. We
+      // retrieve it here through the private IDXGIDXVKDevice interface.
+      // Also propagate Vulkan handles so that FSR/framegen dispatch
+      // (which use s_device) work correctly from dxgi.dll.
+      if (Vegas::s_dxvkDevice == nullptr && m_presenter != nullptr) {
+        Com<IDXGIDXVKDevice> metaDevice;
+        if (SUCCEEDED(m_presenter->GetDevice(__uuidof(IDXGIDXVKDevice),
+                reinterpret_cast<void**>(&metaDevice)))) {
+          Vegas::s_dxvkDevice = static_cast<DxvkDevice*>(
+              metaDevice->GetDXVKDevice());
+          // Propagate Vulkan handles for FSR/framegen
+          if (Vegas::s_device == nullptr && Vegas::s_dxvkDevice != nullptr) {
+            Vegas::s_device         = reinterpret_cast<void*>(
+                Vegas::s_dxvkDevice->handle());
+            Vegas::s_physicalDevice = reinterpret_cast<uint64_t>(
+                Vegas::s_dxvkDevice->adapter()->handle());
+            Vegas::s_vkQueue        = reinterpret_cast<uint64_t>(
+                Vegas::s_dxvkDevice->queues().graphics.queueHandle);
+            Vegas::s_queueFamily    =
+                Vegas::s_dxvkDevice->queues().graphics.queueFamily;
+          }
+        }
+      }
+
       // Fix 3: Real GPU load from gpuIdleTicks delta.
       //   Replaces the old ftRatio-based proxy with true GPU idle
       //   accumulation from the submission queue. Follows the same

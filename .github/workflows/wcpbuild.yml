@@ -53,11 +53,15 @@ jobs:
           mv "$VDIR/x32" ./
           rm -rf "$VDIR"
 
-      - name: Package WCP
+      - name: Prepare DLL directories
         run: |
           cd ./workdir
           mv x64 system32
           mv x32 syswow64
+
+      - name: Package WCP (DXVK type — stock Winlator)
+        run: |
+          cd ./workdir
           cat > profile.json << 'JSONEOF'
           {
             "type": "DXVK",
@@ -80,11 +84,42 @@ jobs:
           tar --zstd -cf "../dxvk-2.7.3-vegas-${{ steps.get-sha.outputs.sha }}.wcp" \
             system32/ syswow64/ profile.json
 
-      - name: Upload WCP
+      - name: Package WCP (VEGAS type — Star Emulator)
+        run: |
+          cd ./workdir
+          cat > profile.json << 'JSONEOF'
+          {
+            "type": "VEGAS",
+            "versionName": "vegas-2.7.3",
+            "versionCode": 1,
+            "description": "VEGAS — community DXVK fork optimized for Adreno GPUs",
+            "files": [
+              {"source": "system32/d3d9.dll",      "target": "${system32}/d3d9.dll"},
+              {"source": "system32/d3d10core.dll", "target": "${system32}/d3d10core.dll"},
+              {"source": "system32/d3d11.dll",     "target": "${system32}/d3d11.dll"},
+              {"source": "system32/dxgi.dll",      "target": "${system32}/dxgi.dll"},
+              {"source": "syswow64/d3d8.dll",      "target": "${syswow64}/d3d8.dll"},
+              {"source": "syswow64/d3d9.dll",      "target": "${syswow64}/d3d9.dll"},
+              {"source": "syswow64/d3d10core.dll", "target": "${syswow64}/d3d10core.dll"},
+              {"source": "syswow64/d3d11.dll",     "target": "${syswow64}/d3d11.dll"},
+              {"source": "syswow64/dxgi.dll",      "target": "${syswow64}/dxgi.dll"}
+            ]
+          }
+          JSONEOF
+          tar --zstd -cf "../vegas-2.7.3-${{ steps.get-sha.outputs.sha }}.wcp" \
+            system32/ syswow64/ profile.json
+
+      - name: Upload WCP (DXVK type — stock Winlator)
         uses: actions/upload-artifact@v4
         with:
-          name: wcp-${{ steps.get-sha.outputs.sha }}
+          name: wcp-dxvk-${{ steps.get-sha.outputs.sha }}
           path: ./dxvk-*.wcp
+
+      - name: Upload WCP (VEGAS type — Star Emulator)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wcp-vegas-${{ steps.get-sha.outputs.sha }}
+          path: ./vegas-*.wcp
 
       - name: Upload vegas config
         uses: actions/upload-artifact@v4

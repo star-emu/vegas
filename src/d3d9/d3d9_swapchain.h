@@ -7,8 +7,10 @@
 #include "../dxvk/hud/dxvk_hud.h"
 
 #include "../dxvk/dxvk_swapchain_blitter.h"
+#include "../dxvk/dxvk_vegas.h"
 
 #include "../util/sync/sync_signal.h"
+#include "../util/util_time.h"
 
 #include "../wsi/wsi_window.h"
 #include "../wsi/wsi_monitor.h"
@@ -170,6 +172,12 @@ namespace dxvk {
     wsi::DxvkWindowState      m_windowState;
 
     double                    m_targetFrameRate = 0.0;
+
+    // Vegas frame timing (D3D9 swapchain, pushed to shared DxvkDevice metrics)
+    dxvk::high_resolution_clock::time_point  m_lastPresentTime;
+    uint64_t                                 m_prevGpuIdleTicks = 0;
+    bool                                     m_gpuLoadValid = false;
+    VegasPerformanceState                    m_lastPerfState = VegasPerformanceState::Normal;
 
     double                    m_displayRefreshRate = 0.0;
     bool                      m_displayRefreshRateDirty = true;

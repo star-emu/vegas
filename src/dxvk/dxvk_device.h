@@ -26,7 +26,10 @@
 #include "dxvk_unbound.h"
 
 namespace dxvk {
-  
+
+  // Forward declaration for VegasMetrics cross-DLL sharing
+  enum class VegasPerformanceState : uint32_t;
+
   class DxvkInstance;
   class DxvkShaderCache;
 
@@ -680,6 +683,32 @@ namespace dxvk {
      * \returns Result of the submission
      */
     VkResult waitForSubmission(DxvkSubmitStatus* status);
+
+    /**
+     * \brief Vegas metrics shared across DLLs
+     *
+     * Written by pushMetrics() in the DLL where PresentBase runs,
+     * read by VegasHud in the DLL where the HUD renders.
+     * The DxvkDevice object is shared (same pointer value in both
+     * DLLs), so this struct provides the cross-DLL bridge.
+     *
+     * initialized is set to true by initializeProfile() (d3d11.dll).
+     * Runtime metrics are written by pushMetrics() (dxgi.dll).
+     * Getters read from here first, falling back to per-DLL statics.
+     */
+    struct VegasMetrics {
+      float    gpuLoad       = 0.0f;
+      float    frameTime     = 0.0f;
+      uint32_t tier          = 0;
+      uint32_t perfState     = 0;  // VegasPerformanceState::Normal = 0
+      bool     initialized   = false;
+      bool     fsrActive     = false;
+      bool     fgActive      = false;
+      float    ftHistory[60] = {};
+      uint32_t ftHead        = 0;
+    };
+
+    VegasMetrics m_vegasMetrics;
 
     /**
      * \brief Waits for a fence to become signaled

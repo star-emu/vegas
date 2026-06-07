@@ -759,4 +759,35 @@ FSR viable on Turnip.
 
 ---
 
+## 9. CI Pipeline & WCP Dual Build
+
+### Workflows
+
+| Workflow | Trigger | Produces |
+|----------|---------|----------|
+| `build.yml` | `workflow_dispatch` | x64 + x32 DLLs (via MinGW cross-build) |
+| `wcpbuild.yml` | `workflow_dispatch` | WCP packages + vegas config artifact |
+
+### WCP Dual Build
+
+`wcpbuild.yml` builds **two** `.wcp` archives from the same DLLs. The only
+difference is the embedded `profile.json` metadata:
+
+| Artifact | `profile.json` type | Archive Name | Purpose |
+|----------|---------------------|--------------|---------|
+| `wcp-dxvk-<sha>` | `"type": "DXVK"` | `dxvk-2.7.3-vegas-<sha>.wcp` | Stock Winlator compatibility |
+| `wcp-vegas-<sha>` | `"type": "VEGAS"` | `vegas-2.7.3-<sha>.wcp` | Star Emulator (latest build) |
+
+The `vegas-config-<sha>` artifact ships the `vegas/dxvk.conf` alongside.
+
+### Adding a New Package Type
+
+If you need a third type variant:
+1. Add a new `Package WCP (<type>)` step in `wcpbuild.yml` — same DLLs, different
+   `profile.json` content and archive filename
+2. Add a matching `Upload WCP (<type>)` step
+3. Update this table
+
+---
+
 *Last updated: 2026-06-07 | Branch: vegas*

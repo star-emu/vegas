@@ -5,6 +5,9 @@
 #include "d3d9_hud.h"
 #include "d3d9_window.h"
 
+#include "../dxvk/dxvk_vegas.h"
+#include "../util/util_time.h"
+
 namespace dxvk {
 
   static uint16_t MapGammaControlPoint(float x) {
@@ -22,6 +25,7 @@ namespace dxvk {
     , m_device           (pDevice->GetDXVKDevice())
     , m_frameLatencyCap  (pDevice->GetOptions()->maxFrameLatency)
     , m_latencyTracking  (EnableLatencyTracking)
+    , m_lastPresentTime  (dxvk::high_resolution_clock::now())
     , m_swapchainExt     (this) {
     this->NormalizePresentParameters(pPresentParams);
     m_presentParams = *pPresentParams;
@@ -184,6 +188,59 @@ namespace dxvk {
     if (useGDIFallback)
       return PresentImageGDI(m_window);
 #endif
+
+    // --- VEGAS: Frame timing and metrics push ---
+    {
+      auto now = dxvk::high_resolution_clock::now();
+      float frameTime = std::chrono::duration<float, std::milli>(
+          now - m_lastPresentTime).count();
+
+      // GPU load from gpuIdleTicks delta (same pattern as DxgiSwapChain::PresentBase)
+      float gpuLoadEstimate = 0.0f;
+      if (Vegas::s_dxvkDevice != nullptr) {
+        DxvkStatCounters counters = Vegas::s_dxvkDevice->getStatCounters();
+        uint64_t currGpuIdleTicks = counters.getCtr(DxvkStatCounter::GpuIdleTicks);
+
+        if (m_gpuLoadValid) {
+          uint64_t diffIdle = currGpuIdleTicks - m_prevGpuIdleTicks;
+          uint64_t wallUs   = static_cast<uint64_t>(frameTime * 1000.0f);
+          if (wallUs > 0) {
+            uint64_t busyUs = (wallUs > diffIdle) ? (wallUs - diffIdle) : 0u;
+            gpuLoadEstimate = std::min(
+                static_cast<float>(busyUs) / static_cast<float>(wallUs), 1.0f);
+          }
+        }
+        m_prevGpuIdleTicks = currGpuIdleTicks;
+        m_gpuLoadValid = true;
+      }
+
+      // ftRatio fallback
+      if (!m_gpuLoadValid) {
+        float targetFt = (m_targetFrameRate > 0.0)
+            ? static_cast<float>(1000.0 / m_targetFrameRate)
+            : 16.667f;
+        float ftRatio = (targetFt > 0.0f) ? (frameTime / targetFt) : 1.0f;
+        if      (ftRatio > 2.0f) gpuLoadEstimate = 0.96f;
+        else if (ftRatio > 1.5f) gpuLoadEstimate = 0.92f;
+        else if (ftRatio > 1.2f) gpuLoadEstimate = 0.85f;
+        else if (ftRatio > 0.9f) gpuLoadEstimate = 0.65f;
+        else if (ftRatio > 0.5f) gpuLoadEstimate = 0.40f;
+        else                      gpuLoadEstimate = 0.25f;
+      }
+
+      m_lastPerfState = Vegas::analyzePerformance(
+          gpuLoadEstimate, frameTime,
+          (m_targetFrameRate > 0.0)
+              ? static_cast<float>(1000.0 / m_targetFrameRate)
+              : 16.667f);
+
+      Vegas::pushMetrics(gpuLoadEstimate, frameTime,
+          m_lastPerfState,
+          /* fsrActive */ false,
+          /* fgActive  */ false);
+
+      m_lastPresentTime = now;
+    }
 
     try {
       UpdateWindowedRefreshRate();

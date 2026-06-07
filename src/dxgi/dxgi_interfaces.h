@@ -182,6 +182,15 @@ IDXGIDXVKDevice : public IUnknown {
 
   virtual UINT STDMETHODCALLTYPE GetAPIVersion() = 0;
 
+  /**
+   * \brief Returns raw DxvkDevice pointer
+   *
+   * Used to resolve the DXVK device from dxgi.dll for cross-DLL
+   * metrics sharing via DxvkDevice::VegasMetrics.
+   * Returns void* to avoid requiring dxvk_device.h in this header.
+   */
+  virtual void* STDMETHODCALLTYPE GetDXVKDevice() = 0;
+
 };
 
 
