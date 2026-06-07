@@ -7,8 +7,8 @@
 
 #include <hud_frame_time_eval.h>
 
-#include <hud_graph_frag.h>
-#include <hud_graph_vert.h>
+#include "hud_graph_frag.h"
+#include "hud_graph_vert.h"
 
 #include <iomanip>
 #include <version.h>
@@ -369,6 +369,10 @@ namespace dxvk::hud {
           uint32_t            dataPoint,
           HudPos              graphPos,
           HudPos              graphSize) {
+    // Query Vega performance state for color and label
+    VegasPerformanceState perfState  = Vegas::getLastPerfState();
+    uint32_t              stateColor = Vegas::getGraphColor(perfState);
+
     DxvkDescriptorWrite descriptorWrite;
     descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     descriptorWrite.buffer = m_gpuBuffer->getSliceInfo(0u, computeBufferLayout().timestampSize);
@@ -380,6 +384,7 @@ namespace dxvk::hud {
     pushConstants.w = graphSize.x;
     pushConstants.h = graphSize.y;
     pushConstants.frameIndex = dataPoint;
+    pushConstants.stateColor = stateColor;
 
     ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
       VK_PIPELINE_BIND_POINT_GRAPHICS, getPipeline(renderer, key));
@@ -389,6 +394,12 @@ namespace dxvk::hud {
       sizeof(pushConstants), &pushConstants);
 
     ctx->cmdDraw(4, 1, 0, 0);
+
+    // Draw performance state text at top-left of the graph
+    renderer.drawText(12,
+      { graphPos.x + 4, graphPos.y + 2 },
+      stateColor | 0xFF000000u,
+      Vegas::getStatusString(perfState));
 
     ctx->track(m_gpuBuffer, DxvkAccess::Read);
   }

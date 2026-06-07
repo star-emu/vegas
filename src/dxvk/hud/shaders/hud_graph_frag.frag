@@ -28,6 +28,7 @@ uniform push_data_t {
   uint  packed_xy;
   uint  packed_wh;
   uint  frame_index;
+  uint  state_color;
 };
 
 int max_index = NUM_FRAME_TIME_STAMPS - 1;
@@ -75,7 +76,11 @@ void main() {
 
   float ms_y = ms_max * v_coord.y;
 
-  vec4 line_color = vec4(0.776f, 0.812f, 0.882f, 1.0f);
+  vec4 line_color = vec4(
+    float((state_color >> 16) & 0xFFu) / 255.0f,
+    float((state_color >> 8) & 0xFFu) / 255.0f,
+    float((state_color >> 0) & 0xFFu) / 255.0f,
+    1.0f);
   vec4 bg_color = vec4(0.0f, 0.0f, 0.0f, 0.75f);
 
   // Try to draw a somewhat defined line

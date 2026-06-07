@@ -8,6 +8,7 @@
 #include "../../util/util_time.h"
 
 #include "../dxvk_gpu_query.h"
+#include "../dxvk_vegas.h"
 
 #include "dxvk_hud_renderer.h"
 
@@ -283,6 +284,7 @@ namespace dxvk::hud {
       int16_t w;
       int16_t h;
       uint32_t frameIndex;
+      uint32_t stateColor;
     };
 
     struct BufferLayout {

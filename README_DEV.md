@@ -25,7 +25,7 @@ navigate and modify the code efficiently.
     - 3.11 BCn→ASTC Transcoder (Gated)
     - 3.12 GPU Persona & VRAM Masking
     - 3.13 Performance Analysis & Logging
-    - 3.14 VegasHud Overlay
+    - 3.14 Frametime Graph Performance Colors
 4. [Config Options Reference](#4-config-options)
 5. [Adding a New Feature](#5-adding-a-new-feature)
 6. [Testing Methodology](#6-testing-methodology)
@@ -56,12 +56,12 @@ GPU pacing, and HUD rendering — all gated behind a single master switch
  │  dxvk_device.cpp             │  HAAE submission throttle
  │  dxvk_pipemanager.cpp        │  compiler thread cap
  │  dxvk_shader_cache.cpp       │  periodic cache flush
- │  dxvk_swapchain_blitter.cpp  │  VegasHud rendering (composite + direct)
+ │  dxvk_swapchain_blitter.cpp  │  HUD composition (DXVK upstream path only)
  ├──────────────────────────────┤
  │  dxvk_vegas.cpp              │  ALL feature logic, decision helpers,
  │  dxvk_vegas.h                │  metrics push + FT history ring buffer
- │  dxvk_vegas_hud.cpp          │  VegasHud overlay: text + ASCII bar graph
- │  dxvk_vegas_hud.h            │  VegasHud class declaration
+ │  hud/dxvk_hud_item.cpp       │  Frametime graph with Vegas perf colors
+ │  hud/shaders/hud_graph_frag  │  Dynamic line_color from push constant
  │  dxvk_fence.h/.cpp           │  DxvkFence timeline semaphore (leegao)
  │  dxvk_options.h/.cpp         │  config option declarations
  ├──────────────────────────────┤
@@ -89,12 +89,14 @@ Per-Frame (PresentBase):
   → fsrTryBlitResult() (non-blocking getValue() check, blits completed
      intermediate → swapchain, ~0.1ms sync blit)
   → needsFrameGen() → framegenDispatch() if eligible
-  → pushMetrics() → stores gpuLoad, frameTime, perfState, fsrActive, fgActive
-                     in Vegas static members for VegasHud consumption
+   → pushMetrics() → stores gpuLoad, frameTime, perfState, fsrActive, fgActive
+                      in Vegas static members for frametime graph consumption
 
-Per-Present (DxvkSwapchainBlitter::present):
-  → m_hud->update/render()          (DXVK HUD, top-left)
-  → m_vegasHud->render()            (VegasHud, top-right, reads Vegas statics)
+Per-Draw (drawFrameTimeGraph, hud_item.cpp):
+  → drawFrameTimeGraph()
+    → Vegas::getLastPerfState() + getGraphColor()
+    → passes stateColor as push constant to hud_graph_frag
+    → renderer.drawText() for state label (NORMAL/LAGGING/STUTTERING/OVERHEATING)
 
 Per-Draw (draw/drawIndexed):
   shouldFlush(drawCount) → spill render pass + flush command list if over threshold
@@ -114,8 +116,9 @@ Per-Submit (submitCommandList):
 |------|---------|--------------|
 | `src/dxvk/dxvk_vegas.h` | All declarations | `Vegas` class (55+ static methods), `VegasProfile` struct, `VegasPerformanceState` enum, `VegasFsrConstants` struct, 40+ static member variables including FT history ring buffer |
 | `src/dxvk/dxvk_vegas.cpp` | All implementations | ~3650 lines. Tier classifier, TBDR-inverted governor, async FSR via DxvkFence, FG dispatch, BCn→ASTC transcoder, pushMetrics() + getters, static variable definitions, anonymous namespace helpers |
-| `src/dxvk/dxvk_vegas_hud.h` | VegasHud declaration | `VegasHud` class with own `HudRenderer` instance, config-aware enable, color constants |
-| `src/dxvk/dxvk_vegas_hud.cpp` | VegasHud implementation | ~216 lines. 5-element right-aligned overlay: header, tier/load/ft, perf state + features, numeric FT history, ASCII bar graph |
+| `src/dxvk/hud/dxvk_hud_item.h` | Frametime graph (extended) | `RenderPushConstants` extended with `stateColor`. Includes `dxvk_vegas.h` |
+| `src/dxvk/hud/dxvk_hud_item.cpp` | Frametime graph rendering | `drawFrameTimeGraph()` reads `Vegas::getLastPerfState()`, passes color to shader, draws state label |
+| `src/dxvk/hud/shaders/hud_graph_frag.frag` | Graph fragment shader | Accepts `state_color` push constant, unpacks to dynamic RGB line color |
 | `src/dxvk/dxvk_fence.h` | DxvkFence timeline semaphore (leegao) | Non-blocking GPU completion check via `getValue()` for async FSR |
 | `src/dxvk/dxvk_fence.cpp` | DxvkFence implementation | Timeline semaphore wrapper with `getValue()`, `wait()`, `handle()` |
 
@@ -130,18 +133,16 @@ Per-Submit (submitCommandList):
 | `src/dxvk/dxvk_shader_cache.cpp` | 444-502 | 60s periodic flush in `runWriter()` |
 | `src/dxvk/dxvk_fence.h` | all | DxvkFence timeline semaphore class declaration |
 | `src/dxvk/dxvk_fence.cpp` | all | Timeline semaphore wrapper: `getValue()`, `wait()`, `handle()` |
-| `src/dxvk/dxvk_swapchain_blitter.h` | 9, 214, 234 | `#include "dxvk_vegas_hud.h"`, `unique_ptr<VegasHud>` member |
-| `src/dxvk/dxvk_swapchain_blitter.cpp` | 10, 16-18, 72, 117-119, 392-395, 423-425, 434-435 | VegasHud creation in constructor, render calls in present() and renderHudImage() |
-| `src/dxvk/dxvk_options.h` | 76-91 | Vegas config options (including vegas.enableHud) |
+| `src/dxvk/dxvk_options.h` | 76-91 | Vegas config options |
 | `src/dxvk/dxvk_options.cpp` | 26-29 | Config parsing |
 
 ### DXGI/D3D11 Integration Points
 
 | File | Lines | What Vegas Does There |
 |------|-------|-----------------------|
-| `src/dxgi/dxgi_swapchain.cpp` | 348-503 | frame timing + governor (unconditional analysis), FSR dispatch, framegen dispatch, pushMetrics() for VegasHud |
+| `src/dxgi/dxgi_swapchain.cpp` | 348-503 | frame timing + governor (unconditional analysis), FSR dispatch, framegen dispatch, pushMetrics() |
 | `src/dxgi/dxgi_swapchain.h` | 205-210 | Vegas state members (m_lastPresentTime, m_lastPerfState, m_needsFrameGen, etc.) |
-| `src/dxgi/dxgi_options.h` | 63-64 | `vegasEnableUpscaler` + `vegasEnableHud` Tristate options |
+| `src/dxgi/dxgi_options.h` | 63-64 | `vegasEnableUpscaler` Tristate option |
 | `src/d3d11/d3d11_swapchain.cpp` | — | Backbuffer count fix (respect BufferCount ≥2) |
 
 ### SPIR-V Shaders
@@ -514,74 +515,82 @@ Vegas: Perf=LAGGING ftRatio=1.5 load=0.92 frameTime=25.0ms frameGen=no
 
 ---
 
-### 3.14 VegasHud Overlay
+### 3.14 Frametime Graph Performance Colors
 
-**New files:** `src/dxvk/dxvk_vegas_hud.h`, `src/dxvk/dxvk_vegas_hud.cpp`
+**Files modified:** `src/dxvk/hud/dxvk_hud_item.cpp`, `src/dxvk/hud/dxvk_hud_item.h`,
+`src/dxvk/hud/shaders/hud_graph_frag.frag`, `src/dxvk/hud/shaders/hud_graph_vert.vert`
 
-**Wired into:** `src/dxvk/dxvk_swapchain_blitter.cpp` (present path)
+The standalone VegasHud overlay has been **removed**. Its functionality is now
+integrated directly into the upstream DXVK frametime graph (`DXVK_HUD=frametimes`):
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
-| `VegasHud` class | `dxvk_vegas_hud.h:16-65` | Standalone overlay with own `HudRenderer`, config-aware enable |
-| `VegasHud::render()` | `dxvk_vegas_hud.cpp:35-190` | Renders 4-line right-aligned overlay + compact ASCII bar graph: header, tier/load/ft, perf state + features, numeric FT history, frame-time bar chart |
-| `Vegas::pushMetrics()` | `dxvk_vegas.cpp:2950-2964` | Called from `PresentBase` — stores gpuLoad, frameTime, perfState, fsrActive, fgActive |
-| `Vegas::s_ftHistory[]` | `dxvk_vegas.cpp:80` | Circular buffer of last 60 frame times for HUD consumption |
+| `DrawFrameTimeGraph()` | `dxvk_hud_item.cpp:365-405` | Queries `Vegas::getLastPerfState()` + `getGraphColor()`, passes color via push constant |
+| `RenderPushConstants::stateColor` | `dxvk_hud_item.h:287` | New uint32_t field added at end of push constant struct (+4 bytes) |
+| `hud_graph_frag.frag` | `shaders/hud_graph_frag.frag:31,79-83` | Accepts `state_color` push constant, unpacks to dynamic RGB line color |
+| `Vegas::getGraphColor()` | `dxvk_vegas.cpp:408-416` | Returns `0x00FF00`/`0xFFFF00`/`0xFF8800`/`0xFF0000` based on state |
+| `Vegas::getStatusString()` | `dxvk_vegas.cpp:419-427` | Returns `"NORMAL"`/`"LAGGING"`/`"STUTTERING"`/`"OVERHEATING"` |
 
-**Data Pipeline:**
+**Push constant layout (36 bytes total):**
+```
+offset 0:  uvec2 surface_size   (VkExtent2D, 8 bytes)
+offset 8:  float opacity        (4 bytes)
+offset 12: float scale          (4 bytes)
+offset 16: uint samplerIndex    (4 bytes)
+offset 20: uint packed_xy       (2×int16 → 4 bytes)
+offset 24: uint packed_wh       (2×int16 → 4 bytes)
+offset 28: uint frame_index     (4 bytes)
+offset 32: uint state_color     (4 bytes)  ← NEW
+```
+
+**Color extraction in shader:**
+```glsl
+vec4 line_color = vec4(
+    float((state_color >> 16) & 0xFFu) / 255.0f,  // R
+    float((state_color >> 8)  & 0xFFu) / 255.0f,  // G
+    float((state_color >> 0)  & 0xFFu) / 255.0f,  // B
+    1.0f);
+```
+
+**Data flow:**
 ```
 dxgi_swapchain.cpp:PresentBase
-  → Vegas::pushMetrics(gpuLoad, frameTime, perfState, fsrActive, fgActive)
-    → writes to Vegas static members (s_lastGpuLoad, s_ftHistory, etc.)
+  → Vegas::pushMetrics(gpuLoad, frameTime, perfState, ...)
+    → writes to Vegas static members
 
-dxvk_swapchain_blitter.cpp:present
-  → m_vegasHud->render(ctx, dstView)
-    → HudRenderer::beginFrame()
-    → draws 4 text lines using Vega statics
-    → HudRenderer::flushDraws()
-    → HudRenderer::endFrame()
+dxvk_hud_item.cpp:drawFrameTimeGraph()
+  → Vegas::getLastPerfState()           → determines state
+  → Vegas::getGraphColor(perfState)     → gets 0x00RRGGBB color
+  → sets pushConstants.stateColor       → passed to GPU
+  → renderer.drawText()                 → draws state label on graph
 ```
 
-**Layout (top-right corner):**
-```
-VEGAS v1.0              ← cyan header
-T3  72%  16.7ms          ← tier / load / frame time (color-coded by perf state)
-NORMAL  FSR  FG          ← state + active features
-FT: 16.7 15.2 18.1 ...   ← numeric history (last 6 frames)
- #####  @@@ ### @@@      ← compact ASCII bar graph (20 bars × 4 levels)
-   ### @@@ ### @@@
-   ### @@@ ### @@@
-  ################
-```
+**Color mapping:**
+| State | Color | Hex | When |
+|-------|-------|-----|------|
+| NORMAL | Green | `0x00FF00` | Frame time < 1.5× target |
+| LAGGING | Yellow | `0xFFFF00` | Frame time ≥ 1.5× target |
+| STUTTERING | Orange | `0xFF8800` | Frame-to-frame delta > 1.25× target |
+| OVERHEATING | Red | `0xFF0000` | Load ≥ 95% AND ft ≥ 3× target |
 
-**Config:** `vegas.enableHud = Auto` (enabled on Adreno when StarProfile active)
+**Shader compilation:** Both `hud_graph_frag.frag` and `hud_graph_vert.vert` are
+compiled via `glslangValidator` to SPIR-V C headers at build time (meson
+`glsl_generator`). The generated `hud_graph_frag.h` and `hud_graph_vert.h` are
+placed in `src/dxvk/hud/` and included with quoted paths for local resolution.
 
-**Design decisions:**
-- Completely independent of `DXVK_HUD` — uses its own `HudRenderer` instance
-- Both HUDs can be active simultaneously without conflict
-- Renders inside the existing render pass (no extra `cmdBeginRendering`)
-- Composite path: baked into the HUD composition image alongside DXVK HUD
-- Non-composite path: renders directly onto the swapchain image
-- Bar graph uses stacked ASCII characters (`#`, `@`, `!`) to form 20-bar × 4-level columns; bitmap font lacks Unicode block chars so density encoding via character choice is used instead
-- Bar heights map to 4 discrete levels (0–12.5ms, 12.5–25ms, 25–37.5ms, 37.5–50ms); characters `#` (normal), `@` (warning), `!` (critical) encode both height and frame-time quality
-
-**File list for the subsystem:**
-| File | Lines |
-|------|-------|
-| `src/dxvk/dxvk_vegas.h` | metrics members + getters (~30 lines) |
-| `src/dxvk/dxvk_vegas.cpp` | pushMetrics() + FT history + getters (~65 lines) |
-| `src/dxvk/dxvk_vegas_hud.h` | class declaration (67 lines) |
-| `src/dxvk/dxvk_vegas_hud.cpp` | implementation (~195 lines) |
-| `src/dxvk/dxvk_swapchain_blitter.h` | include + unique_ptr member (+3 lines) |
-| `src/dxvk/dxvk_swapchain_blitter.cpp` | construction + render calls (+18 lines) |
+**Deleted:**
+- `src/dxvk/dxvk_vegas_hud.cpp` (216 lines — standalone overlay)
+- `src/dxvk/dxvk_vegas_hud.h` (67 lines — class declaration)
+- `vegas.enableHud` config option (removed from `dxvk_options.h/.cpp`,
+  `dxgi_options.h/.cpp`)
 
 ## 4. Config Options
 
 | Config Key | Type | Default | Declared In | Read In | Purpose |
 |---|---|---|---|---|---|
 | `dxvk.enableStarProfile` | Tristate | Auto | `dxvk_options.h:79` | `dxvk_options.cpp:26`, `vegas.cpp:898` | Master switch for ALL Vegas features |
-| `vegas.enableHud` | Tristate | Auto | `dxvk_options.h:86` | `dxvk_options.cpp:28`, `vegas_hud.cpp:17` | VegasHud overlay: tier/load/ft, perf state, FT history, ASCII bar graph |
 | `vegas.enableUpscaler` | Tristate | Auto | `dxvk_options.h:83` | `dxvk_options.cpp:27`, `dxgi_options.cpp:130` | FSR 1.0 spatial upscaler |
-| `vegas.forceTier` | int32_t | 0 | `dxvk_options.h:91` | `dxvk_options.cpp:29`, `vegas.cpp:947-949` | Override GPU tier detection |
+| `vegas.forceTier` | int32_t | 0 | `dxvk_options.h:91` | `dxvk_options.cpp:28`, `vegas.cpp:947-949` | Override GPU tier detection |
 | `dxvk.enableAsync` | bool | false | `dxvk_options.h:15` | `dxvk_options.cpp:24`, `context.cpp:5874` | Async pipeline compilation |
 | `dxvk.numCompilerThreads` | int32_t | 0 | `dxvk_options.h:22` | `dxvk_options.cpp:8` | Override compiler thread count |
 
@@ -685,7 +694,7 @@ adb logcat -s "DXVK" | grep -E "ERROR|WARN|VUID"
 - **GetImage errors:** Should be 0 (indicates swapchain buffer count bug)
 - **tuneThreshold log:** Shows governor adapting threshold dynamically
 - **ftRatio:** Should vary between 0.5-2.0 during gameplay
-- **VegasHud bar graph:** ASCII bars (`#`/`@`/`!`) should show frame-time distribution; bars shrink under light load, grow under heavy load
+- **Frametime graph color:** Graph line changes color with performance state (green→yellow→orange→red); state label (NORMAL/LAGGING/etc.) visible at top-left of graph
 - **Compiler threads:** "Using N compiler threads" — should be ≤4 on ARM64
 
 ### Regression Checklist

@@ -11,6 +11,7 @@ uniform push_data_t {
   uint  packed_xy;
   uint  packed_wh;
   uint  frame_index;
+  uint  state_color;
 };
 
 vec2 unpack_u16(uint v) {

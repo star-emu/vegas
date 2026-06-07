@@ -125,7 +125,6 @@ dxvk_src = [
   'dxvk_unbound.cpp',
   'dxvk_util.cpp',
   'dxvk_vegas.cpp',
-  'dxvk_vegas_hud.cpp',
 
   'hud/dxvk_hud.cpp',
   'hud/dxvk_hud_font.cpp',

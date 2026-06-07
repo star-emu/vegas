@@ -25,7 +25,6 @@ namespace dxvk {
 
     enableStarProfile   = config.getOption<Tristate>("dxvk.enableStarProfile",   Tristate::Auto);
     vegasEnableUpscaler = config.getOption<Tristate>("vegas.enableUpscaler", Tristate::Auto);
-    vegasEnableHud      = config.getOption<Tristate>("vegas.enableHud",      Tristate::Auto);
     vegasForceTier      = config.getOption<int32_t> ("vegas.forceTier",          0);
 
     auto budget = config.getOption<int32_t>("dxvk.maxMemoryBudget", 0);

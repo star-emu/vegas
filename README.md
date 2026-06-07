@@ -77,20 +77,16 @@ from 0.25 to 0.96). Planned replacement with real `gpuIdleTicks()` (Fix 3).
 Skips redundant `vkCmdBindPipeline` calls when no dynamic state has changed — reduces CPU overhead on the draw call path.
 
 ### HUD Performance Colors
-Graph coloring via `getGraphColor()`:
-`green` (normal) → `yellow` (lagging) → `orange` (stuttering) → `red` (overheating)
+The upstream DXVK **frametime graph** (`DXVK_HUD=frametimes`) is color-coded by
+performance state in real time:
+- **Green** (Normal) — smooth sailing
+- **Yellow** (Lagging) — frame time exceeds 1.5× target
+- **Orange** (Stuttering) — frame-to-frame delta > 1.25× target
+- **Red** (Overheating) — GPU load ≥95% AND frame time ≥ 3× target
 
-### VegasHud Overlay (`vegas.enableHud`)
-Standalone dynamic overlay — independent of `DXVK_HUD`:
-- Always at **top-right**, always visible
-- Tier, GPU load, frame time, performance state
-- Active features (FSR, frame generation)
-- Numeric frame-time history (last 6 frames)
-- Compact ASCII bar graph (20 bars × 4 levels, last 20 frames)
-- Frame-time color-coded: `#` green, `@` amber, `!` red
-- All color-coded by performance state (green/yellow/orange/red)
-
-Controlled by `vegas.enableHud = Auto | True | False`. Defaults to **Auto** (enabled on Adreno).
+The current state label (NORMAL / LAGGING / STUTTERING / OVERHEATING) is drawn
+at the top-left of the graph in the same color. This replaces the standalone
+VegasHud overlay — no separate HUD configuration needed.
 
 ---
 
@@ -133,9 +129,6 @@ Or set `DXVK_CONFIG_FILE` to your config path.
 # Master switch: Auto (Adreno only), True (force-on), False (force-off)
 dxvk.enableStarProfile = Auto
 
-# VegasHud overlay: Auto (default on Adreno), True, False
-vegas.enableHud = Auto
-
 # FSR 1.0 upscaler: Auto, True, False
 vegas.enableUpscaler = Auto
 
@@ -171,6 +164,7 @@ The output DLLs (`d3d9.dll`, `d3d11.dll`, `dxgi.dll`, etc.) are placed in `/outp
 
 | Commit | Feature |
 |--------|---------|
+| `HEAD` | **Remove VegasHud overlay.** Color-coded frametime graph replaces standalone overlay. `DXVK_HUD=frametimes` now shows dynamic colors (green→yellow→orange→red) and state label |
 | `07914da` | **VegasHud:** positioning fix (char width 8→10.5px), ASCII bar graph (20-bar × 4-level), leegao credits |
 | `24e48a3` | **Stable release:** WCP versionCode 0→1, WCP CI checkout fix |
 | `735e09e` | **WCP CI:** remove vkResetCommandBuffer from async FSR (not in FsrVulkanFuncs) |
@@ -189,7 +183,7 @@ The output DLLs (`d3d9.dll`, `d3d11.dll`, `dxgi.dll`, etc.) are placed in `/outp
 ## Notes
 
 - **Tier 1 (Adreno 5xx/6xx low-end):** Frame generation disabled. FSR available but not recommended at very low resolutions.
-- **VegasHud:** The overlay (`vegas.enableHud`) is independent of `DXVK_HUD` — both can be active simultaneously without conflict.
+- **Performance state coloring:** The upstream frametime graph (`DXVK_HUD=frametimes`) now reflects the current Vegas performance state in real time — no separate HUD overlay needed.
 - **BCn→ASTC transcoder:** Implemented but deferred — the simplified encoder produces visual quality loss that outweighs the narrow benefit (only helps old Qualcomm blob, not Turnip). Available in code for future developers who want to integrate a proper encoder (e.g., `ispc_texcomp`).
 - **Turnip driver:** Use Mesa 25.x+ with Vulkan 1.3 support for descriptor indexing and push constants.
 - **Synthetic benchmarks:** May show lower FPS than stock due to draw thresholds. Judge performance by actual gameplay smoothness.
