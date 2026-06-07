@@ -1995,11 +1995,12 @@ namespace dxvk {
       s_fsrAsyncCmdBuf = reinterpret_cast<uint64_t>(newBuf);
     }
 
-    VkCommandPool   cmdPool = reinterpret_cast<VkCommandPool>(s_fsrAsyncCmdPool);
     VkCommandBuffer cmdBuf  = reinterpret_cast<VkCommandBuffer>(s_fsrAsyncCmdBuf);
 
-    // Reset command buffer for reuse
-    s_vk.vkResetCommandBuffer(cmdBuf, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+    // vkBeginCommandBuffer below implicitly resets the buffer.
+    // No explicit vkResetCommandBuffer needed — the timeline semaphore
+    // guarantees the previous submit completed, returning the buffer
+    // to VK_COMMAND_BUFFER_STATE_INITIAL.
 
     // --- Create src view (per-frame; destroyed after timeline signals) ---
     VkImageViewCreateInfo viewCI = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
