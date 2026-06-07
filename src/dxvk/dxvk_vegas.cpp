@@ -52,6 +52,19 @@ namespace dxvk {
   uint32_t Vegas::s_fsrInterW        = 0;
   uint32_t Vegas::s_fsrInterH        = 0;
 
+  // DxvkDevice stored for DxvkFence creation
+  DxvkDevice*  Vegas::s_dxvkDevice      = nullptr;
+  // Async FSR state
+  void*        Vegas::s_fsrFence        = nullptr;
+  uint64_t     Vegas::s_fsrNextValue    = 0;
+  bool         Vegas::s_fsrInFlight     = false;
+  uint32_t     Vegas::s_fsrResultW      = 0;
+  uint32_t     Vegas::s_fsrResultH      = 0;
+  uint64_t     Vegas::s_fsrLastSrcView  = 0;
+  uint64_t     Vegas::s_fsrInterView    = 0;
+  uint64_t     Vegas::s_fsrAsyncCmdPool = 0;
+  uint64_t     Vegas::s_fsrAsyncCmdBuf  = 0;
+
   // Framegen resources
   uint64_t Vegas::s_fgPipeline[3]     = {0, 0, 0};
   uint64_t Vegas::s_fgPipelineLayout  = 0;
@@ -161,8 +174,11 @@ namespace dxvk {
           bindSkip = true;
           tier = classifyAdrenoTier(props.deviceName);
           // VEGAS: Set default tier-based threshold (fallback)
-          static constexpr uint32_t defaultThresholds[] = {600, 1200, 2000};
-          threshold = (tier >= 1 && tier <= 3) ? defaultThresholds[tier - 1] : 600;
+          // TBDR-aware: Adreno (tile-based) benefits from EARLIER flushes
+          // to avoid tile buffer overflow. Desktop thresholds (600-2000)
+          // cause tile thrashing on mobile. Halved for TBDR safety.
+          static constexpr uint32_t defaultThresholds[] = {100, 200, 350};
+          threshold = (tier >= 1 && tier <= 3) ? defaultThresholds[tier - 1] : 100;
       }
   }
 
@@ -171,11 +187,13 @@ namespace dxvk {
       initializeProfile(threshold, enabled, bindSkip, tier, device);
 
       if (isD3D9 && enabled) {
-          static constexpr uint32_t d3d9ThresholdTable[] = {1500, 3000, 5000};
+          // D3D9 on TBDR: D3D9 draw calls are typically larger (more vertices
+          // per call) so thresholds are higher than D3D11, but still TBDR-aware.
+          static constexpr uint32_t d3d9ThresholdTable[] = {300, 500, 800};
           if (tier >= 1 && tier <= 3) {
               threshold = d3d9ThresholdTable[tier - 1];
           } else {
-              threshold = 1500;
+              threshold = 300;
           }
       }
   }
@@ -189,21 +207,37 @@ namespace dxvk {
   //   - Resets to base on moderate load to prevent sticky high thresholds
   //   - Low-load path requires sustained frame time > 8 ms (avoids transient spikes)
   void Vegas::tuneThreshold(uint32_t& threshold, float load, float frameTime, uint32_t tier) {
-      static constexpr uint32_t baseThresholds[] = { 600, 1200, 2000 };
-      uint32_t base = (tier >= 1 && tier <= 3) ? baseThresholds[tier - 1] : 600;
+      // TBDR-aware base thresholds — Adreno tile-based renderers need
+      // frequent flushes to avoid tile buffer overflow. Halved from
+      // desktop values.
+      static constexpr uint32_t baseThresholds[] = { 100, 200, 350 };
+      uint32_t base = (tier >= 1 && tier <= 3) ? baseThresholds[tier - 1] : 100;
 
-      // Tier-based cap multiplier
-      static constexpr float capMultipliers[] = { 1.5f, 2.5f, 3.0f };
-      float multiplier = (tier >= 1 && tier <= 3) ? capMultipliers[tier - 1] : 1.5f;
+      // Tier-based cap multiplier (TBDR: conservative caps to prevent
+      // tile buffer thrashing at high batch counts)
+      static constexpr float capMultipliers[] = { 2.0f, 2.0f, 1.7f };
+      float multiplier = (tier >= 1 && tier <= 3) ? capMultipliers[tier - 1] : 2.0f;
       uint32_t cap = static_cast<uint32_t>(base * multiplier);
 
-      if ((load > 0.90f && frameTime > 25.0f) ||
-          (load < 0.60f && frameTime > 8.0f)) {
-          // High sustained load (GPU-bound) or low sustained load (headroom):
-          // raise threshold to amortise flush overhead
+      // TBDR-aware governor logic:
+      //
+      // High sustained GPU load (load>0.90, ft>25ms):
+      //   → GPU-bound, batch more to amortize submission overhead
+      //
+      // Low GPU load with high frame time (load<0.40, ft>12ms):
+      //   → CPU-bound! TBDR driver overhead from over-batching is
+      //     starving the GPU. REDUCE threshold aggressively to let
+      //     GPU start tiling earlier.
+      //
+      // Everything else: reset to base to prevent sticky thresholds.
+      if (load > 0.90f && frameTime > 25.0f) {
+          // GPU-bound — batch more draws
           threshold = cap;
+      } else if (load < 0.40f && frameTime > 12.0f) {
+          // CPU-bound — flush more frequently for TBDR pacing
+          threshold = std::max(50u, base / 2);
       } else {
-          // Moderate load — reset to base to prevent sticky high thresholds
+          // Balanced — reset to base
           threshold = base;
       }
   }
@@ -907,6 +941,8 @@ namespace dxvk {
       return;
     }
 
+    s_dxvkDevice = device;
+
     // Master switch: dxvk.enableStarProfile
     // Auto  → Adreno detection (current behavior)
     // True  → force-enable all Vegas features
@@ -965,12 +1001,16 @@ namespace dxvk {
         s_tier = static_cast<uint32_t>(overrideTier);
     }
 
-    // Bake draw thresholds based on GPU tier (D3D11 base)
-    static constexpr uint32_t drawThresholdTable[] = { 600, 1200, 2000 };
-    // Bleeding-edge: inverted HAAE thresholds fixed.
-    // Tier 1 (low-end) needs MORE frequent pacing (lower threshold)
-    // to prevent GPU overwhelm. Tier 3 (high-end) can batch longer.
-    static constexpr uint32_t haaeThresholdTable[] = { 50, 100, 150 };
+    // Bake draw thresholds based on GPU tier (TBDR-aware, D3D11 base).
+    // Adreno/Turnip is tile-based deferred renderer; thresholds must be
+    // low enough that the GPU's tile buffer (~256KB-1MB depending on tier)
+    // doesn't overflow within a single render pass.
+    // Desktop values (600-2000) cause tile thrashing on all mobile GPUs.
+    static constexpr uint32_t drawThresholdTable[] = { 100, 200, 350 };
+    // HAAE thresholds: Tier 1 (low-end) needs MORE frequent pacing (lower
+    // threshold) to prevent tile buffer overflow. Tier 3 (mid-end) can
+    // batch slightly more but still TBDR-limited.
+    static constexpr uint32_t haaeThresholdTable[] = { 30, 50, 80 };
 
     uint32_t idx = (s_tier >= 1 && s_tier <= 3) ? s_tier - 1 : 0;
     s_drawThreshold = drawThresholdTable[idx];
@@ -1322,7 +1362,15 @@ namespace dxvk {
       return true;  // already exists at correct size
     }
 
+    // Drain any in-flight async FSR compute before destroying the
+    // intermediate image (prevents GPU crash on resize).
+    Vegas::fsrDrain();
+
     // Destroy old intermediate if any (size mismatch or first init)
+    if (Vegas::s_fsrInterView != 0) {
+      s_vk.vkDestroyImageView(device, reinterpret_cast<VkImageView>(Vegas::s_fsrInterView), nullptr);
+      Vegas::s_fsrInterView = 0;
+    }
     if (Vegas::s_fsrInterImage != 0) {
       s_vk.vkDestroyImage(device, reinterpret_cast<VkImage>(Vegas::s_fsrInterImage), nullptr);
       Vegas::s_fsrInterImage = 0;
@@ -1408,6 +1456,27 @@ namespace dxvk {
     Vegas::s_fsrInterMemory = reinterpret_cast<uint64_t>(interMem);
     Vegas::s_fsrInterW      = extent.width;
     Vegas::s_fsrInterH      = extent.height;
+
+    // Create persistent intermediate image view (for async FSR descriptor set)
+    VkImageViewCreateInfo viewCI = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    viewCI.image            = interImage;
+    viewCI.viewType         = VK_IMAGE_VIEW_TYPE_2D;
+    viewCI.format           = VK_FORMAT_R8G8B8A8_UNORM;
+    viewCI.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewCI.subresourceRange.baseMipLevel   = 0;
+    viewCI.subresourceRange.levelCount     = 1;
+    viewCI.subresourceRange.baseArrayLayer = 0;
+    viewCI.subresourceRange.layerCount     = 1;
+
+    VkImageView interView = VK_NULL_HANDLE;
+    vr = s_vk.vkCreateImageView(device, &viewCI, nullptr, &interView);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas FSR: vkCreateImageView(intermediate) failed (", vr, ")"));
+      // Non-fatal: keep image, view will be created on demand
+      Vegas::s_fsrInterView = 0;
+    } else {
+      Vegas::s_fsrInterView = reinterpret_cast<uint64_t>(interView);
+    }
 
     Logger::debug(str::format("Vegas FSR: intermediate image created (",
                               extent.width, "x", extent.height, ")"));
@@ -1783,6 +1852,618 @@ namespace dxvk {
         " -> ", dstExtent.width, "x", dstExtent.height));
     return true;
   }
+
+
+  // ================================================================
+  // ====  Async FSR — DxvkFence (timeline semaphore)  ===============
+  // ================================================================
+  //
+  // Splits the original synchronous fsrUpscale into two non-blocking
+  // phases:
+  //
+  //   Phase 1 (fsrUpscaleAsync):
+  //     Submit EASU compute to intermediate image with a timeline
+  //     semaphore (DxvkFence) signal.  Returns immediately — CPU does
+  //     NOT wait for GPU completion.
+  //
+  //   Phase 2 (fsrTryBlitResult):
+  //     On the next frame, check the timeline semaphore non-blockingly
+  //     (DxvkFence::getValue).  If the compute is done, submit a fast
+  //     synchronous blit from intermediate → swapchain dst (≈0.1 ms).
+  //
+  // Result: zero CPU blocking for the expensive compute dispach;
+  // only the cheap blit blocks, for ~0.1 ms per frame.
+  //
+  // Resource lifetime:
+  //   - intermediate image: persistent, managed by ensureFsrIntermediate
+  //   - intermediate view (interView): persistent, managed by ensureFsrIntermediate
+  //   - src image view: created per frame in fsrUpscaleAsync, destroyed
+  //     in fsrTryBlitResult after timeline semaphore signals.
+  //
+  // ================================================================
+
+
+  bool Vegas::fsrUpscaleAsync(
+          VkImage              srcImage,
+          VkExtent3D           srcExtent,
+          VkExtent3D           dstExtent,
+          VkFormat             swapchainFormat,
+          VegasFsrConstants&   fsrConsts) {
+    // ================================================================
+    // Guard: only one async FSR in flight at a time
+    // ================================================================
+    if (s_fsrInFlight) {
+      Logger::debug("Vegas FSR async: skipped — previous compute still in flight");
+      return false;
+    }
+
+    // ================================================================
+    // Format guard — FSR only on UNORM swapchain formats
+    // ================================================================
+    if (swapchainFormat != VK_FORMAT_B8G8R8A8_UNORM &&
+        swapchainFormat != VK_FORMAT_R8G8B8A8_UNORM) {
+      Logger::debug(str::format(
+          "Vegas FSR async: skipped — unsupported swapchain format 0x",
+          std::hex, static_cast<uint32_t>(swapchainFormat)));
+      return false;
+    }
+
+    // ================================================================
+    // Get device & queue handles
+    // ================================================================
+    VkDevice device = reinterpret_cast<VkDevice>(s_device);
+    VkQueue  queue  = reinterpret_cast<VkQueue>(s_vkQueue);
+    if (device == VK_NULL_HANDLE || queue == VK_NULL_HANDLE) {
+      Logger::debug("Vegas FSR async: skipped — no VkDevice/VkQueue");
+      return false;
+    }
+
+    // ================================================================
+    // Load Vulkan functions (lazy, one-time)
+    // ================================================================
+    if (!loadVulkanFuncs(device)) {
+      Logger::debug("Vegas FSR async: skipped — Vulkan functions not available");
+      return false;
+    }
+
+    // ================================================================
+    // Init FSR pipeline (lazy, one-time)
+    // ================================================================
+    if (!initFsrPipeline(device)) {
+      Logger::debug("Vegas FSR async: skipped — pipeline init failed");
+      return false;
+    }
+
+    // ================================================================
+    // Ensure intermediate image exists at dstExtent
+    // ================================================================
+    if (!ensureFsrIntermediate(device, dstExtent)) {
+      Logger::debug("Vegas FSR async: skipped — intermediate image creation failed");
+      return false;
+    }
+
+    // ================================================================
+    // Ensure DxvkFence (timeline semaphore) exists
+    // ================================================================
+    if (!s_fsrFence) {
+      if (!s_dxvkDevice) {
+        Logger::debug("Vegas FSR async: skipped — no DxvkDevice for fence creation");
+        return false;
+      }
+      DxvkFenceCreateInfo fenceInfo = {};
+      fenceInfo.initialValue = 0;
+      s_fsrFence = reinterpret_cast<void*>(new DxvkFence(s_dxvkDevice, fenceInfo));
+      s_fsrNextValue = 1;
+      Logger::debug("Vegas FSR async: DxvkFence created");
+    }
+
+    VkPipeline            pipeline        = reinterpret_cast<VkPipeline>(s_fsrPipeline);
+    VkPipelineLayout      pipelineLayout  = reinterpret_cast<VkPipelineLayout>(s_fsrPipelineLayout);
+    VkDescriptorSetLayout descSetLayout   = reinterpret_cast<VkDescriptorSetLayout>(s_fsrDescSetLayout);
+    VkDescriptorPool      descPool        = reinterpret_cast<VkDescriptorPool>(s_fsrDescPool);
+    VkImage               interImage      = reinterpret_cast<VkImage>(s_fsrInterImage);
+    VkImageView           interView       = reinterpret_cast<VkImageView>(s_fsrInterView);
+
+    VkResult vr;
+
+    // --- Create/lazy-init persistent async command pool + buffer ---
+    // These live across frames to avoid destroying a pool while a
+    // submitted command buffer is still pending on the GPU.
+    if (s_fsrAsyncCmdPool == 0) {
+      VkCommandPoolCreateInfo poolCI = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+      poolCI.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+      poolCI.queueFamilyIndex = s_queueFamily;
+      VkCommandPool newPool = VK_NULL_HANDLE;
+      vr = s_vk.vkCreateCommandPool(device, &poolCI, nullptr, &newPool);
+      if (vr != VK_SUCCESS) {
+        Logger::warn(str::format("Vegas FSR async: vkCreateCommandPool failed (", vr, ")"));
+        return false;
+      }
+      s_fsrAsyncCmdPool = reinterpret_cast<uint64_t>(newPool);
+    }
+    if (s_fsrAsyncCmdBuf == 0) {
+      VkCommandBufferAllocateInfo allocCI = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+      allocCI.commandPool        = reinterpret_cast<VkCommandPool>(s_fsrAsyncCmdPool);
+      allocCI.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+      allocCI.commandBufferCount = 1;
+      VkCommandBuffer newBuf = VK_NULL_HANDLE;
+      vr = s_vk.vkAllocateCommandBuffers(device, &allocCI, &newBuf);
+      if (vr != VK_SUCCESS) {
+        Logger::warn(str::format("Vegas FSR async: vkAllocateCommandBuffers failed (", vr, ")"));
+        return false;
+      }
+      s_fsrAsyncCmdBuf = reinterpret_cast<uint64_t>(newBuf);
+    }
+
+    VkCommandPool   cmdPool = reinterpret_cast<VkCommandPool>(s_fsrAsyncCmdPool);
+    VkCommandBuffer cmdBuf  = reinterpret_cast<VkCommandBuffer>(s_fsrAsyncCmdBuf);
+
+    // Reset command buffer for reuse
+    s_vk.vkResetCommandBuffer(cmdBuf, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+
+    // --- Create src view (per-frame; destroyed after timeline signals) ---
+    VkImageViewCreateInfo viewCI = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    viewCI.viewType     = VK_IMAGE_VIEW_TYPE_2D;
+    viewCI.format       = swapchainFormat;
+    viewCI.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewCI.subresourceRange.baseMipLevel   = 0;
+    viewCI.subresourceRange.levelCount     = 1;
+    viewCI.subresourceRange.baseArrayLayer = 0;
+    viewCI.subresourceRange.layerCount     = 1;
+
+    viewCI.image = srcImage;
+    VkImageView srcView = VK_NULL_HANDLE;
+    vr = s_vk.vkCreateImageView(device, &viewCI, nullptr, &srcView);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas FSR async: vkCreateImageView(src) failed (", vr, ")"));
+      return false;
+    }
+
+    // --- Allocate + update descriptor set ---
+    s_vk.vkResetDescriptorPool(device, descPool, 0);
+
+    VkDescriptorSetAllocateInfo descAlloc = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    descAlloc.descriptorPool     = descPool;
+    descAlloc.descriptorSetCount = 1;
+    descAlloc.pSetLayouts        = &descSetLayout;
+    VkDescriptorSet descSet = VK_NULL_HANDLE;
+    vr = s_vk.vkAllocateDescriptorSets(device, &descAlloc, &descSet);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas FSR async: vkAllocateDescriptorSets failed (", vr, ")"));
+      s_vk.vkDestroyImageView(device, srcView, nullptr);
+      return false;
+    }
+
+    VkDescriptorImageInfo srcImgInfo = {};
+    srcImgInfo.sampler     = VK_NULL_HANDLE;
+    srcImgInfo.imageView   = srcView;
+    srcImgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo interImgInfo = {};
+    interImgInfo.sampler     = VK_NULL_HANDLE;
+    interImgInfo.imageView   = interView;
+    interImgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet writes[2] = {};
+    writes[0].sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet           = descSet;
+    writes[0].dstBinding       = 0;
+    writes[0].descriptorCount  = 1;
+    writes[0].descriptorType   = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[0].pImageInfo       = &srcImgInfo;
+
+    writes[1].sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet           = descSet;
+    writes[1].dstBinding       = 1;
+    writes[1].descriptorCount  = 1;
+    writes[1].descriptorType   = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[1].pImageInfo       = &interImgInfo;
+
+    s_vk.vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+
+    // ================================================================
+    // Record command buffer — compute only (no blit)
+    // ================================================================
+    VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vr = s_vk.vkBeginCommandBuffer(cmdBuf, &beginInfo);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas FSR async: vkBeginCommandBuffer failed (", vr, ")"));
+      s_vk.vkDestroyImageView(device, srcView, nullptr);
+      return false;
+    }
+
+    // Barrier: src PRESENT_SRC_KHR -> GENERAL (for shader read)
+    VkImageMemoryBarrier srcBarrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    srcBarrier.srcAccessMask    = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    srcBarrier.dstAccessMask    = VK_ACCESS_SHADER_READ_BIT;
+    srcBarrier.oldLayout        = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    srcBarrier.newLayout        = VK_IMAGE_LAYOUT_GENERAL;
+    srcBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    srcBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    srcBarrier.image            = srcImage;
+    srcBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    s_vk.vkCmdPipelineBarrier(cmdBuf,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &srcBarrier);
+
+    // Barrier: intermediate UNDEFINED -> GENERAL (contents always overwritten)
+    // Using UNDEFINED is safe: the compute shader writes every pixel.
+    // This also gives the driver freedom to discard stale tile data.
+    VkImageMemoryBarrier interBarrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    interBarrier.srcAccessMask    = 0;
+    interBarrier.dstAccessMask    = VK_ACCESS_SHADER_WRITE_BIT;
+    interBarrier.oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED;
+    interBarrier.newLayout        = VK_IMAGE_LAYOUT_GENERAL;
+    interBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    interBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    interBarrier.image            = interImage;
+    interBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    s_vk.vkCmdPipelineBarrier(cmdBuf,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &interBarrier);
+
+    // --- FSR compute dispatch: src -> intermediate ---
+    s_vk.vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    s_vk.vkCmdBindDescriptorSets(cmdBuf,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        pipelineLayout, 0, 1, &descSet, 0, nullptr);
+    s_vk.vkCmdPushConstants(cmdBuf, pipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0,
+        sizeof(VegasFsrConstants), &fsrConsts);
+
+    uint32_t gx = (dstExtent.width  + 15) / 16;
+    uint32_t gy = (dstExtent.height + 15) / 16;
+    s_vk.vkCmdDispatch(cmdBuf, gx, gy, 1);
+
+    // Barrier: src GENERAL -> PRESENT_SRC_KHR (restore for next acquire)
+    VkImageMemoryBarrier srcBack = {};
+    srcBack.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    srcBack.srcAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+    srcBack.dstAccessMask       = 0;
+    srcBack.oldLayout           = VK_IMAGE_LAYOUT_GENERAL;
+    srcBack.newLayout           = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    srcBack.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    srcBack.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    srcBack.image               = srcImage;
+    srcBack.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    s_vk.vkCmdPipelineBarrier(cmdBuf,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &srcBack);
+
+    // NOTE: inter remains in GENERAL — fsrTryBlitResult will transition
+    // to TRANSFER_SRC_OPTIMAL for the blit and back to GENERAL afterwards.
+
+    vr = s_vk.vkEndCommandBuffer(cmdBuf);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas FSR async: vkEndCommandBuffer failed (", vr, ")"));
+      s_vk.vkDestroyImageView(device, srcView, nullptr);
+      return false;
+    }
+
+    // ================================================================
+    // Submit with timeline semaphore signal — NO WAIT
+    // ================================================================
+    DxvkFence* fence = reinterpret_cast<DxvkFence*>(s_fsrFence);
+    uint64_t signalValue = s_fsrNextValue;
+    VkSemaphore timelineSema = fence->handle();
+
+    VkTimelineSemaphoreSubmitInfo timelineInfo = {
+      VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+    timelineInfo.waitSemaphoreValueCount   = 0;
+    timelineInfo.pWaitSemaphoreValues      = nullptr;
+    timelineInfo.signalSemaphoreValueCount = 1;
+    timelineInfo.pSignalSemaphoreValues    = &signalValue;
+
+    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.pNext                  = &timelineInfo;
+    submitInfo.commandBufferCount     = 1;
+    submitInfo.pCommandBuffers        = &cmdBuf;
+    submitInfo.signalSemaphoreCount   = 1;
+    submitInfo.pSignalSemaphores      = &timelineSema;
+
+    vr = s_vk.vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas FSR async: vkQueueSubmit failed (", vr, ")"));
+      s_vk.vkDestroyImageView(device, srcView, nullptr);
+      return false;
+    }
+
+    // ================================================================
+    // Post-submit bookkeeping
+    // ================================================================
+
+    // Destroy any leftover src view from a prior submit that was never
+    // cleaned up (should not happen if s_fsrInFlight was correctly false,
+    // but guard against fence gets eaten by an error path).
+    if (s_fsrLastSrcView != 0) {
+      s_vk.vkDestroyImageView(device,
+          reinterpret_cast<VkImageView>(s_fsrLastSrcView), nullptr);
+      s_fsrLastSrcView = 0;
+    }
+
+    // Store srcView for destruction after fence signals
+    s_fsrLastSrcView = reinterpret_cast<uint64_t>(srcView);
+
+    // Advance timeline value
+    s_fsrNextValue++;
+
+    // Mark in-flight
+    s_fsrInFlight = true;
+
+    Logger::debug(str::format("Vegas FSR async: submitted compute ",
+        srcExtent.width, "x", srcExtent.height,
+        " -> ", dstExtent.width, "x", dstExtent.height,
+        " (timeline value ", signalValue, ")"));
+    return true;
+  }
+
+
+  bool Vegas::fsrTryBlitResult(
+          VkImage              dstImage,
+          VkExtent3D           dstExtent) {
+    // ================================================================
+    // Nothing to blit if no async FSR is in flight
+    // ================================================================
+    if (!s_fsrInFlight) {
+      return false;
+    }
+
+    if (!s_fsrFence) {
+      return false;
+    }
+
+    // ================================================================
+    // Non-blocking check: has the previous async compute completed?
+    // ================================================================
+    DxvkFence* fence = reinterpret_cast<DxvkFence*>(s_fsrFence);
+    uint64_t completedValue = fence->getValue();
+    uint64_t expectedValue  = s_fsrNextValue - 1; // last submitted value
+
+    if (completedValue < expectedValue) {
+      // FSR compute still running — skip blit this frame
+      return false;
+    }
+
+    // ================================================================
+    // Compute is done! Destroy the previous frame's src view.
+    // ================================================================
+    VkDevice device = reinterpret_cast<VkDevice>(s_device);
+    VkQueue  queue  = reinterpret_cast<VkQueue>(s_vkQueue);
+    if (device == VK_NULL_HANDLE || queue == VK_NULL_HANDLE) {
+      Logger::debug("Vegas FSR blit: skipped — no VkDevice/VkQueue");
+      return false;
+    }
+
+    if (s_fsrLastSrcView != 0) {
+      s_vk.vkDestroyImageView(device,
+          reinterpret_cast<VkImageView>(s_fsrLastSrcView), nullptr);
+      s_fsrLastSrcView = 0;
+    }
+
+    // ================================================================
+    // Synchronous blit: inter (GENERAL) → dst (PRESENT → TRANSFER_DST)
+    // ================================================================
+    VkImage interImage = reinterpret_cast<VkImage>(s_fsrInterImage);
+    if (interImage == VK_NULL_HANDLE) {
+      s_fsrInFlight = false;
+      return false;
+    }
+
+    // --- Create temp command pool + buffer + fence ---
+    VkCommandPoolCreateInfo poolCI = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    poolCI.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    poolCI.queueFamilyIndex = s_queueFamily;
+    VkCommandPool cmdPool = VK_NULL_HANDLE;
+    VkResult vr = s_vk.vkCreateCommandPool(device, &poolCI, nullptr, &cmdPool);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas FSR blit: vkCreateCommandPool failed (", vr, ")"));
+      s_fsrInFlight = false;
+      return false;
+    }
+
+    VkCommandBufferAllocateInfo allocCI = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    allocCI.commandPool        = cmdPool;
+    allocCI.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocCI.commandBufferCount = 1;
+    VkCommandBuffer cmdBuf = VK_NULL_HANDLE;
+    vr = s_vk.vkAllocateCommandBuffers(device, &allocCI, &cmdBuf);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas FSR blit: vkAllocateCommandBuffers failed (", vr, ")"));
+      s_vk.vkDestroyCommandPool(device, cmdPool, nullptr);
+      s_fsrInFlight = false;
+      return false;
+    }
+
+    VkFenceCreateInfo fenceCI = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence blitFence = VK_NULL_HANDLE;
+    vr = s_vk.vkCreateFence(device, &fenceCI, nullptr, &blitFence);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas FSR blit: vkCreateFence failed (", vr, ")"));
+      s_vk.vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuf);
+      s_vk.vkDestroyCommandPool(device, cmdPool, nullptr);
+      s_fsrInFlight = false;
+      return false;
+    }
+
+    VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vr = s_vk.vkBeginCommandBuffer(cmdBuf, &beginInfo);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas FSR blit: vkBeginCommandBuffer failed (", vr, ")"));
+      s_vk.vkDestroyFence(device, blitFence, nullptr);
+      s_vk.vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuf);
+      s_vk.vkDestroyCommandPool(device, cmdPool, nullptr);
+      s_fsrInFlight = false;
+      return false;
+    }
+
+    // Barrier: inter GENERAL -> TRANSFER_SRC_OPTIMAL
+    // The timeline semaphore guarantees the compute shader has finished
+    // writing. Use ALL_COMMANDS as srcStage to be safe.
+    VkImageMemoryBarrier interToBlit = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    interToBlit.srcAccessMask    = VK_ACCESS_SHADER_WRITE_BIT;
+    interToBlit.dstAccessMask    = VK_ACCESS_TRANSFER_READ_BIT;
+    interToBlit.oldLayout        = VK_IMAGE_LAYOUT_GENERAL;
+    interToBlit.newLayout        = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    interToBlit.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    interToBlit.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    interToBlit.image            = interImage;
+    interToBlit.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    s_vk.vkCmdPipelineBarrier(cmdBuf,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &interToBlit);
+
+    // Barrier: dst PRESENT_SRC_KHR -> TRANSFER_DST_OPTIMAL
+    VkImageMemoryBarrier dstToBlit = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    dstToBlit.srcAccessMask    = 0;
+    dstToBlit.dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT;
+    dstToBlit.oldLayout        = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    dstToBlit.newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    dstToBlit.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dstToBlit.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dstToBlit.image            = dstImage;
+    dstToBlit.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    s_vk.vkCmdPipelineBarrier(cmdBuf,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &dstToBlit);
+
+    // --- Blit inter -> dst (nearest filter, 1:1 scale) ---
+    VkImageBlit blitRegion = {};
+    blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blitRegion.srcSubresource.layerCount = 1;
+    blitRegion.srcOffsets[0] = { 0, 0, 0 };
+    blitRegion.srcOffsets[1] = { static_cast<int32_t>(dstExtent.width),
+                                 static_cast<int32_t>(dstExtent.height), 1 };
+    blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blitRegion.dstSubresource.layerCount = 1;
+    blitRegion.dstOffsets[0] = { 0, 0, 0 };
+    blitRegion.dstOffsets[1] = { static_cast<int32_t>(dstExtent.width),
+                                 static_cast<int32_t>(dstExtent.height), 1 };
+
+    s_vk.vkCmdBlitImage(cmdBuf,
+        interImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        dstImage,   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &blitRegion, VK_FILTER_NEAREST);
+
+    // Barrier: inter TRANSFER_SRC_OPTIMAL -> GENERAL (for next async compute)
+    VkImageMemoryBarrier interBack = {};
+    interBack.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    interBack.srcAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+    interBack.dstAccessMask       = 0;
+    interBack.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    interBack.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
+    interBack.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    interBack.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    interBack.image               = interImage;
+    interBack.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    // Barrier: dst TRANSFER_DST_OPTIMAL -> PRESENT_SRC_KHR
+    VkImageMemoryBarrier dstBack = {};
+    dstBack.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    dstBack.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+    dstBack.dstAccessMask       = 0;
+    dstBack.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    dstBack.newLayout           = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    dstBack.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dstBack.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dstBack.image               = dstImage;
+    dstBack.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    VkImageMemoryBarrier postBarriers[2] = { interBack, dstBack };
+    s_vk.vkCmdPipelineBarrier(cmdBuf,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0, 0, nullptr, 0, nullptr, 2, postBarriers);
+
+    vr = s_vk.vkEndCommandBuffer(cmdBuf);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas FSR blit: vkEndCommandBuffer failed (", vr, ")"));
+      s_vk.vkDestroyFence(device, blitFence, nullptr);
+      s_vk.vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuf);
+      s_vk.vkDestroyCommandPool(device, cmdPool, nullptr);
+      s_fsrInFlight = false;
+      return false;
+    }
+
+    // --- Submit + WAIT (fast, <0.1 ms for blit) ---
+    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers    = &cmdBuf;
+
+    vr = s_vk.vkQueueSubmit(queue, 1, &submitInfo, blitFence);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas FSR blit: vkQueueSubmit failed (", vr, ")"));
+      s_vk.vkDestroyFence(device, blitFence, nullptr);
+      s_vk.vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuf);
+      s_vk.vkDestroyCommandPool(device, cmdPool, nullptr);
+      s_fsrInFlight = false;
+      return false;
+    }
+
+    vr = s_vk.vkWaitForFences(device, 1, &blitFence, VK_TRUE, UINT64_MAX);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas FSR blit: vkWaitForFences failed (", vr, ")"));
+    }
+
+    s_vk.vkDestroyFence(device, blitFence, nullptr);
+    s_vk.vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuf);
+    s_vk.vkDestroyCommandPool(device, cmdPool, nullptr);
+
+    // ================================================================
+    // Bookkeeping
+    // ================================================================
+    s_fsrInFlight     = false;
+    s_fsrResultW      = dstExtent.width;
+    s_fsrResultH      = dstExtent.height;
+
+    Logger::debug(str::format("Vegas FSR blit: completed (",
+                              dstExtent.width, "x", dstExtent.height, ")"));
+    return true;
+  }
+
+
+  void Vegas::fsrDrain() {
+    if (!s_fsrInFlight) {
+      return;
+    }
+
+    if (!s_fsrFence) {
+      s_fsrInFlight = false;
+      return;
+    }
+
+    VkDevice device = reinterpret_cast<VkDevice>(s_device);
+    if (device == VK_NULL_HANDLE) {
+      return;
+    }
+
+    // Block until the async compute finishes
+    DxvkFence* fence = reinterpret_cast<DxvkFence*>(s_fsrFence);
+    uint64_t targetValue = s_fsrNextValue - 1;
+    fence->wait(targetValue);
+
+    // Destroy the src view from the last async submit
+    if (s_fsrLastSrcView != 0) {
+      s_vk.vkDestroyImageView(device,
+          reinterpret_cast<VkImageView>(s_fsrLastSrcView), nullptr);
+      s_fsrLastSrcView = 0;
+    }
+
+    s_fsrInFlight = false;
+    Logger::debug("Vegas FSR: drained async compute");
+  }
+
 
   // ================================================================
   // ====  Frame Generation (3-pass motion-compensated)  =============

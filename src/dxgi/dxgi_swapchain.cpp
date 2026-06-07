@@ -435,23 +435,28 @@ namespace dxvk {
             srcSurface->GetVulkanImageInfo(&srcHandle, nullptr, &srcInfo);
             dstSurface->GetVulkanImageInfo(&dstHandle, nullptr, &dstInfo);
             if (Vegas::shouldUpscale(upscaleState, srcInfo.extent, dstInfo.extent)) {
-              // FSR dispatch: uses intermediate private VkImage with
-              // STORAGE_BIT, then blits to dst (avoids STORAGE_BIT on
-              // swapchain — HIGH risk on Adreno/Turnip).
               VegasFsrConstants fsrConsts = {};
               Vegas::calculateFsrConstants(fsrConsts,
                   srcInfo.extent, dstInfo.extent);
-              Logger::debug(str::format(
-                  "Vegas FSR: attempting upscale ",
-                  srcInfo.extent.width, "x", srcInfo.extent.height,
-                  " -> ", dstInfo.extent.width, "x", dstInfo.extent.height));
-              bool dispatched = Vegas::fsrUpscale(
-                  srcHandle, dstHandle,
-                  srcInfo.extent, dstInfo.extent,
-                  dstInfo.format, fsrConsts);
-              Logger::debug(str::format(
-                  "Vegas FSR: ", dispatched ? "OK" : "SKIPPED/FAILED"));
-              if (dispatched)
+
+              // Phase 1 — non-blocking blit of previous async FSR result.
+              // Returns true if the previous frame's FSR compute completed
+              // and the upscaled result was blitted to the swapchain.
+              bool blitDone = Vegas::fsrTryBlitResult(
+                  dstHandle, dstInfo.extent);
+
+              // Phase 2 — submit new async FSR compute if inter is free.
+              // Only starts a new compute if the previous one finished
+              // (blitDone) or this is the very first FSR frame.
+              bool computed = false;
+              if (blitDone || !Vegas::isFsrActive()) {
+                computed = Vegas::fsrUpscaleAsync(
+                    srcHandle,
+                    srcInfo.extent, dstInfo.extent,
+                    dstInfo.format, fsrConsts);
+              }
+
+              if (blitDone || computed)
                 fsrActive = true;
             }
           }

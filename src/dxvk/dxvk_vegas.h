@@ -45,6 +45,10 @@ namespace dxvk {
    * BCn→ASTC texture transcoding, FSR upscaling support, and
    * governor-style adaptive threshold tuning.
    */
+  // Forward declarations for DXVK types used in async FSR
+  class DxvkFence;
+  class DxvkDevice;
+
   class Vegas {
 
   public:
@@ -209,6 +213,8 @@ namespace dxvk {
     /// \param [in] fsrConsts Pre-computed FSR constants from calculateFsrConstants
     /// \returns true if the dispatch was successfully submitted and completed
     /// \note Fail-closed: returns false on any error. Never crashes the frame.
+    /// Synchronous FSR dispatch (legacy — blocks CPU with vkWaitForFences).
+    /// Preferred: use fsrUpscaleAsync + fsrTryBlitResult for zero CPU blocking.
     static bool fsrUpscale(
             VkImage              srcImage,
             VkImage              dstImage,
@@ -216,6 +222,34 @@ namespace dxvk {
             VkExtent3D           dstExtent,
             VkFormat             swapchainFormat,
             VegasFsrConstants&   fsrConsts);
+
+    /// Async FSR dispatch using DxvkFence (timeline semaphore, leegao).
+    /// Submits EASU compute to s_fsrInterImage without blocking.
+    /// GPU completion is tracked via s_fsrFence for non-blocking check.
+    /// Caller should call fsrTryBlitResult BEFORE this on each frame
+    /// to blit the previous frame's completed result.
+    /// \returns true if compute was successfully submitted.
+    static bool fsrUpscaleAsync(
+            VkImage              srcImage,
+            VkExtent3D           srcExtent,
+            VkExtent3D           dstExtent,
+            VkFormat             swapchainFormat,
+            VegasFsrConstants&   fsrConsts);
+
+    /// Non-blocking blit of the previous frame's completed FSR result.
+    /// Checks s_fsrFence (timeline semaphore) — if the previous async
+    /// FSR compute has finished, blits s_fsrInterImage → dstImage
+    /// with a fast synchronous vkCmdBlitImage.
+    /// \returns true if a completed FSR frame was blitted to dst.
+    static bool fsrTryBlitResult(
+            VkImage              dstImage,
+            VkExtent3D           dstExtent);
+
+    /// Drain any in-flight async FSR compute (blocks until GPU completes).
+    /// Safe to call before destroying the intermediate image (e.g. on
+    /// swapchain resize).  Idempotent — safe to call even if no FSR
+    /// is in flight.
+    static void fsrDrain();
 
     // ---- BCn→ASTC Transcoder (baked auto) ----
 
@@ -302,6 +336,21 @@ namespace dxvk {
     static VegasPerformanceState s_lastPerfState;
     static float               s_lastFrameTime;
     static bool                s_fsrActive;
+
+    // DxvkDevice stored for DxvkFence creation (set by initializeProfile)
+    static DxvkDevice*         s_dxvkDevice;
+
+    // ---- Async FSR (DxvkFence / timeline semaphore) ----
+    static void*               s_fsrFence;        ///< DxvkFence* (timeline semaphore wrapper)
+    static uint64_t            s_fsrNextValue;    ///< next timeline signal value
+    static bool                s_fsrInFlight;     ///< FSR compute submitted, awaiting GPU completion
+    static uint32_t            s_fsrResultW;      ///< completed result width
+    static uint32_t            s_fsrResultH;      ///< completed result height
+    static uint64_t            s_fsrLastSrcView;  ///< VkImageView from last async submit (destroy on fence signal)
+    static uint64_t            s_fsrInterView;    ///< VkImageView (persistent, intermediate image — updated by ensureFsrIntermediate)
+    static uint64_t            s_fsrAsyncCmdPool; ///< VkCommandPool (persistent, for async FSR submits)
+    static uint64_t            s_fsrAsyncCmdBuf;  ///< VkCommandBuffer (persistent, for async FSR submits)
+
     static bool                s_fgActive;
 
     /// Push frame-timing metrics for HUD consumption.
