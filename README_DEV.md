@@ -463,7 +463,7 @@ Vegas: Perf=LAGGING ftRatio=1.5 load=0.92 frameTime=25.0ms frameGen=no
 | Component | Location | Purpose |
 |-----------|----------|---------|
 | `VegasHud` class | `dxvk_vegas_hud.h:16-65` | Standalone overlay with own `HudRenderer`, config-aware enable |
-| `VegasHud::render()` | `dxvk_vegas_hud.cpp:35-148` | Renders 4-line right-aligned overlay: header, tier/load/ft, perf state + features, numeric FT history |
+| `VegasHud::render()` | `dxvk_vegas_hud.cpp:35-190` | Renders 4-line right-aligned overlay + compact ASCII bar graph: header, tier/load/ft, perf state + features, numeric FT history, frame-time bar chart |
 | `Vegas::pushMetrics()` | `dxvk_vegas.cpp:2950-2964` | Called from `PresentBase` — stores gpuLoad, frameTime, perfState, fsrActive, fgActive |
 | `Vegas::s_ftHistory[]` | `dxvk_vegas.cpp:80` | Circular buffer of last 60 frame times for HUD consumption |
 
@@ -487,6 +487,10 @@ VEGAS v1.0              ← cyan header
 T3  72%  16.7ms          ← tier / load / frame time (color-coded by perf state)
 NORMAL  FSR  FG          ← state + active features
 FT: 16.7 15.2 18.1 ...   ← numeric history (last 6 frames)
+ #####  @@@ ### @@@      ← compact ASCII bar graph (20 bars × 4 levels)
+   ### @@@ ### @@@
+   ### @@@ ### @@@
+  ################
 ```
 
 **Config:** `vegas.enableHud = Auto` (enabled on Adreno when StarProfile active)
@@ -497,7 +501,8 @@ FT: 16.7 15.2 18.1 ...   ← numeric history (last 6 frames)
 - Renders inside the existing render pass (no extra `cmdBeginRendering`)
 - Composite path: baked into the HUD composition image alongside DXVK HUD
 - Non-composite path: renders directly onto the swapchain image
-- Bar graph uses numeric FT display since the bitmap HUD font doesn't support Unicode block characters
+- Bar graph uses stacked ASCII characters (`#`, `@`, `!`) to form 20-bar × 4-level columns; bitmap font lacks Unicode block chars so density encoding via character choice is used instead
+- Bar heights map to 4 discrete levels (0–12.5ms, 12.5–25ms, 25–37.5ms, 37.5–50ms); characters `#` (normal), `@` (warning), `!` (critical) encode both height and frame-time quality
 
 **File list for the subsystem:**
 | File | Lines |
@@ -505,7 +510,7 @@ FT: 16.7 15.2 18.1 ...   ← numeric history (last 6 frames)
 | `src/dxvk/dxvk_vegas.h` | metrics members + getters (~30 lines) |
 | `src/dxvk/dxvk_vegas.cpp` | pushMetrics() + FT history + getters (~65 lines) |
 | `src/dxvk/dxvk_vegas_hud.h` | class declaration (67 lines) |
-| `src/dxvk/dxvk_vegas_hud.cpp` | implementation (151 lines) |
+| `src/dxvk/dxvk_vegas_hud.cpp` | implementation (~195 lines) |
 | `src/dxvk/dxvk_swapchain_blitter.h` | include + unique_ptr member (+3 lines) |
 | `src/dxvk/dxvk_swapchain_blitter.cpp` | construction + render calls (+18 lines) |
 
@@ -698,4 +703,33 @@ D3D9 games typically issue more draw calls per frame. The D3D9-aware
 
 ---
 
-*Last updated: 2026-06-06 | Branch: vegas*
+## 8. Credits & Contributors
+
+### Timeline Semaphore (DxvkFence) — leegao
+
+The non-blocking async FSR dispatch (Section 3.9) depends on **leegao's timeline
+semaphore wrapper** (`DxvkFence` in `src/dxvk/dxvk_fence.h/.cpp`). This is a
+clean-room implementation of `VK_KHR_timeline_semaphore` that provides:
+
+- **`getValue()`** — Non-blocking completion check (used on hot path, avoids
+  Turnip-kgsl emulation bug that over-waits on intermediate values)
+- **`wait(value)`** — Blocking wait (used only in `fsrDrain()` on resize)
+- **`handle()`** — Raw `VkSemaphore` for `VkSubmitInfo` pNext
+
+Without leegao's `DxvkFence`, the async FSR path would block on every frame
+with a naive fence wait, destroying the frametime stability that Fix 2 achieves.
+The `getValue()`-only hot-path pattern is the key innovation that makes async
+FSR viable on Turnip.
+
+**Files:** `src/dxvk/dxvk_fence.h`, `src/dxvk/dxvk_fence.cpp`
+
+### Project Credits
+
+- **Lead Developer:** isygold
+- **Base Project:** DXVK v2.7.1+ by doitsujin
+- **Timeline Semaphore:** leegao (DxvkFence)
+- **License:** zlib/libpng
+
+---
+
+*Last updated: 2026-06-07 | Branch: vegas*

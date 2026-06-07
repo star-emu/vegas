@@ -71,7 +71,9 @@ Standalone dynamic overlay — independent of `DXVK_HUD`:
 - Tier, GPU load, frame time, performance state
 - Active features (FSR, frame generation)
 - Numeric frame-time history (last 6 frames)
-- Color-coded by performance state (green/yellow/orange/red)
+- Compact ASCII bar graph (20 bars × 4 levels, last 20 frames)
+- Frame-time color-coded: `#` green, `@` amber, `!` red
+- All color-coded by performance state (green/yellow/orange/red)
 
 Controlled by `vegas.enableHud = Auto | True | False`. Defaults to **Auto** (enabled on Adreno).
 
@@ -143,6 +145,8 @@ The output DLLs (`d3d9.dll`, `d3d11.dll`, `dxgi.dll`, etc.) are placed in `/outp
 | Commit | Feature |
 |--------|---------|
 | `[current]` | **VegasHud:** standalone top-right overlay with `vegas.enableHud` config, tier/load/ft display, performance state colors, numeric FT history |
+| `[current]` | **ASCII bar graph:** 20-bar × 4-level frame-time chart in VegasHud (chars `#`/`@`/`!` encode quality) |
+| `[current]` | **Positioning fix:** corrected char width 8→10.5px in VegasHud (text no longer cut off at right edge) |
 | `bea5128` | **Bleeding-edge:** tier-based governor caps (1.5×/2.5×/3.0×), 15-frame cooldown, real GPU load from ftRatio, HAAE threshold fix (T1:50/T2:100/T3:150), ARM64 compiler thread cap (max 4) |
 | `1e2b208` | Remove per-shader zero-init log spam (3378 lines → 1 summary) |
 | `c99f219` | Respect `BufferCount ≥ 2` regardless of swap effect (fixes Tomb Raider DISCARD-mode) |
@@ -169,6 +173,7 @@ The output DLLs (`d3d9.dll`, `d3d11.dll`, `dxgi.dll`, etc.) are placed in `/outp
 
 - **Lead Developer:** isygold
 - **Base Project:** DXVK v2.7.1+ by doitsujin
+- **Timeline Semaphore (DxvkFence):** leegao — enabled non-blocking async FSR dispatch on Turnip
 - **License:** zlib/libpng
 
 ---
