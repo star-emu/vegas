@@ -91,6 +91,10 @@ namespace dxvk {
   uint64_t Vegas::s_tcLut2Memory           = 0;
   uint64_t Vegas::s_tcLutS2Buffer          = 0;
   uint64_t Vegas::s_tcLutS2Memory          = 0;
+  uint64_t Vegas::s_tcScratchBuffer        = 0;
+  uint64_t Vegas::s_tcScratchMemory        = 0;
+  uint32_t Vegas::s_tcScratchW             = 0;
+  uint32_t Vegas::s_tcScratchH             = 0;
 
   // Framegen intermediate images
   bool     Vegas::s_fgPrevValid       = false;
@@ -1818,6 +1822,435 @@ namespace dxvk {
     Vegas::s_tcInitialized          = true;
 
     Logger::debug("Vegas TC: GPU transcoder pipelines initialized");
+    return true;
+  }
+
+
+  /** Ensure the scratch RGBA8 buffer exists at the given pixel dimensions.
+   *  Destroys and recreates if dimensions changed.
+   *  Buffer is device-local with STORAGE usage (optimal for compute R/W). */
+  static bool ensureTcScratch(VkDevice device, uint32_t width, uint32_t height) {
+    if (Vegas::s_tcScratchBuffer != 0
+        && Vegas::s_tcScratchW == width
+        && Vegas::s_tcScratchH == height) {
+      return true;
+    }
+
+    // Destroy old scratch if any
+    if (Vegas::s_tcScratchBuffer != 0) {
+      s_vk.vkDestroyBuffer(device,
+          reinterpret_cast<VkBuffer>(Vegas::s_tcScratchBuffer), nullptr);
+      Vegas::s_tcScratchBuffer = 0;
+    }
+    if (Vegas::s_tcScratchMemory != 0) {
+      s_vk.vkFreeMemory(device,
+          reinterpret_cast<VkDeviceMemory>(Vegas::s_tcScratchMemory), nullptr);
+      Vegas::s_tcScratchMemory = 0;
+    }
+    Vegas::s_tcScratchW = 0;
+    Vegas::s_tcScratchH = 0;
+
+    VkDeviceSize size = VkDeviceSize(width) * VkDeviceSize(height) * 4;
+
+    VkBufferCreateInfo bufCI = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bufCI.size        = size;
+    bufCI.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bufCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkResult vr = s_vk.vkCreateBuffer(device, &bufCI, nullptr, &buffer);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkCreateBuffer (scratch) failed (", vr, ")"));
+      return false;
+    }
+
+    VkMemoryRequirements memReqs;
+    s_vk.vkGetBufferMemoryRequirements(device, buffer, &memReqs);
+
+    VkPhysicalDevice physDev = reinterpret_cast<VkPhysicalDevice>(Vegas::s_physicalDevice);
+    VkPhysicalDeviceMemoryProperties physMemProps;
+    s_vk.vkGetPhysicalDeviceMemoryProperties(physDev, &physMemProps);
+
+    uint32_t memTypeIdx = UINT32_MAX;
+    // Prefer DEVICE_LOCAL for best compute performance
+    for (uint32_t i = 0; i < physMemProps.memoryTypeCount; ++i) {
+      if ((memReqs.memoryTypeBits & (1u << i)) &&
+          (physMemProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+        memTypeIdx = i;
+        break;
+      }
+    }
+    if (memTypeIdx == UINT32_MAX) {
+      // Fallback to any compatible type
+      for (uint32_t i = 0; i < physMemProps.memoryTypeCount; ++i) {
+        if (memReqs.memoryTypeBits & (1u << i)) {
+          memTypeIdx = i;
+          break;
+        }
+      }
+    }
+    if (memTypeIdx == UINT32_MAX) {
+      Logger::warn("Vegas TC: no compatible memory for scratch buffer");
+      s_vk.vkDestroyBuffer(device, buffer, nullptr);
+      return false;
+    }
+
+    VkMemoryAllocateInfo allocCI = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    allocCI.allocationSize  = memReqs.size;
+    allocCI.memoryTypeIndex = memTypeIdx;
+
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    vr = s_vk.vkAllocateMemory(device, &allocCI, nullptr, &memory);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkAllocateMemory (scratch) failed (", vr, ")"));
+      s_vk.vkDestroyBuffer(device, buffer, nullptr);
+      return false;
+    }
+
+    vr = s_vk.vkBindBufferMemory(device, buffer, memory, 0);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkBindBufferMemory (scratch) failed (", vr, ")"));
+      s_vk.vkFreeMemory(device, memory, nullptr);
+      s_vk.vkDestroyBuffer(device, buffer, nullptr);
+      return false;
+    }
+
+    Vegas::s_tcScratchBuffer = reinterpret_cast<uint64_t>(buffer);
+    Vegas::s_tcScratchMemory = reinterpret_cast<uint64_t>(memory);
+    Vegas::s_tcScratchW      = width;
+    Vegas::s_tcScratchH      = height;
+
+    Logger::debug(str::format("Vegas TC: scratch buffer created (",
+                              width, "x", height, " = ", size, " bytes)"));
+    return true;
+  }
+
+
+  // ---- GPU BCn→ASTC transcoder dispatch (Approach A — independent submit) ----
+
+  /** Format-to-format-ID mapping for the decode shader's switch.
+   *  Must match the constants in vegas_bcn_decode.comp. */
+  static uint32_t bcnFormatToId(VkFormat fmt) {
+    switch (fmt) {
+      case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+      case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+      case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+      case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return 1;
+      case VK_FORMAT_BC3_UNORM_BLOCK:
+      case VK_FORMAT_BC3_SRGB_BLOCK:       return 3;
+      case VK_FORMAT_BC4_UNORM_BLOCK:
+      case VK_FORMAT_BC4_SNORM_BLOCK:      return 4;
+      case VK_FORMAT_BC5_UNORM_BLOCK:
+      case VK_FORMAT_BC5_SNORM_BLOCK:      return 5;
+      case VK_FORMAT_BC7_UNORM_BLOCK:
+      case VK_FORMAT_BC7_SRGB_BLOCK:       return 7;
+      default:                             return 0;
+    }
+  }
+
+  bool Vegas::gpuTranscodeImageData(
+          VkBuffer             srcBuffer,
+          uint32_t             srcOffset,
+          VkBuffer             dstBuffer,
+          uint32_t             dstOffset,
+          VkFormat             srcFormat,
+          uint32_t             width,
+          uint32_t             height) {
+    // ================================================================
+    // Validate inputs
+    // ================================================================
+    uint32_t formatId = bcnFormatToId(srcFormat);
+    if (formatId == 0) {
+      Logger::warn(str::format("Vegas TC: unsupported source format ",
+                               static_cast<int>(srcFormat)));
+      return false;
+    }
+
+    if (width == 0 || height == 0)
+      return false;
+
+    VkDevice device = reinterpret_cast<VkDevice>(s_device);
+    VkQueue  queue  = reinterpret_cast<VkQueue>(s_vkQueue);
+    if (device == VK_NULL_HANDLE || queue == VK_NULL_HANDLE) {
+      Logger::debug("Vegas TC: no VkDevice/VkQueue");
+      return false;
+    }
+
+    // ================================================================
+    // Lazy init
+    // ================================================================
+    if (!loadVulkanFuncs(device)) {
+      Logger::debug("Vegas TC: Vulkan functions not available");
+      return false;
+    }
+    if (!initTranscoderPipeline(device)) {
+      Logger::debug("Vegas TC: pipeline init failed");
+      return false;
+    }
+    if (!ensureTcScratch(device, width, height)) {
+      Logger::debug("Vegas TC: scratch buffer creation failed");
+      return false;
+    }
+
+    VkPipeline           decodePipeline  = reinterpret_cast<VkPipeline>(s_tcDecodePipeline);
+    VkPipelineLayout     decodeLayout    = reinterpret_cast<VkPipelineLayout>(s_tcDecodePipelineLayout);
+    VkDescriptorSetLayout decodeDSL      = reinterpret_cast<VkDescriptorSetLayout>(s_tcDecodeDescLayout);
+    VkPipeline           encodePipeline  = reinterpret_cast<VkPipeline>(s_tcEncodePipeline);
+    VkPipelineLayout     encodeLayout    = reinterpret_cast<VkPipelineLayout>(s_tcEncodePipelineLayout);
+    VkDescriptorSetLayout encodeDSL      = reinterpret_cast<VkDescriptorSetLayout>(s_tcEncodeDescLayout);
+    VkDescriptorPool     descPool        = reinterpret_cast<VkDescriptorPool>(s_tcDescPool);
+    VkBuffer             scratchBuffer   = reinterpret_cast<VkBuffer>(s_tcScratchBuffer);
+    VkBuffer             lut2Buffer      = reinterpret_cast<VkBuffer>(s_tcLut2Buffer);
+    VkBuffer             lutS2Buffer     = reinterpret_cast<VkBuffer>(s_tcLutS2Buffer);
+
+    uint32_t blocksX = (width  + 3) / 4;
+    uint32_t blocksY = (height + 3) / 4;
+    uint32_t numBlocks = blocksX * blocksY;
+
+    VkResult vr;
+
+    // ================================================================
+    // Transient command pool + buffer
+    // ================================================================
+    VkCommandPoolCreateInfo poolCI = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    poolCI.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    poolCI.queueFamilyIndex = s_queueFamily;
+    VkCommandPool cmdPool = VK_NULL_HANDLE;
+    vr = s_vk.vkCreateCommandPool(device, &poolCI, nullptr, &cmdPool);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkCreateCommandPool failed (", vr, ")"));
+      return false;
+    }
+
+    VkCommandBufferAllocateInfo allocCI = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    allocCI.commandPool        = cmdPool;
+    allocCI.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocCI.commandBufferCount = 1;
+    VkCommandBuffer cmdBuf = VK_NULL_HANDLE;
+    vr = s_vk.vkAllocateCommandBuffers(device, &allocCI, &cmdBuf);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkAllocateCommandBuffers failed (", vr, ")"));
+      s_vk.vkDestroyCommandPool(device, cmdPool, nullptr);
+      return false;
+    }
+
+    // ================================================================
+    // Fence
+    // ================================================================
+    VkFenceCreateInfo fenceCI = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence = VK_NULL_HANDLE;
+    vr = s_vk.vkCreateFence(device, &fenceCI, nullptr, &fence);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkCreateFence failed (", vr, ")"));
+      s_vk.vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuf);
+      s_vk.vkDestroyCommandPool(device, cmdPool, nullptr);
+      return false;
+    }
+
+    // ================================================================
+    // Allocate + update descriptor sets
+    // ================================================================
+    s_vk.vkResetDescriptorPool(device, descPool, 0);
+
+    // Decode set: {srcBuffer@0 read, scratchBuffer@1 write}
+    VkDescriptorSetLayout decodeLayouts[1] = { decodeDSL };
+    VkDescriptorSetAllocateInfo descAlloc = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    descAlloc.descriptorPool     = descPool;
+    descAlloc.descriptorSetCount = 1;
+    descAlloc.pSetLayouts        = decodeLayouts;
+    VkDescriptorSet decodeSet = VK_NULL_HANDLE;
+    vr = s_vk.vkAllocateDescriptorSets(device, &descAlloc, &decodeSet);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkAllocateDescriptorSets (decode) failed (", vr, ")"));
+      s_vk.vkDestroyFence(device, fence, nullptr);
+      s_vk.vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuf);
+      s_vk.vkDestroyCommandPool(device, cmdPool, nullptr);
+      return false;
+    }
+
+    // Encode set: {scratchBuffer@0 read, dstBuffer@1 write, lut2@2 read, lutS2@3 read}
+    VkDescriptorSetLayout encodeLayouts[1] = { encodeDSL };
+    descAlloc.pSetLayouts = encodeLayouts;
+    VkDescriptorSet encodeSet = VK_NULL_HANDLE;
+    vr = s_vk.vkAllocateDescriptorSets(device, &descAlloc, &encodeSet);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkAllocateDescriptorSets (encode) failed (", vr, ")"));
+      s_vk.vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuf);
+      s_vk.vkDestroyCommandPool(device, cmdPool, nullptr);
+      s_vk.vkDestroyFence(device, fence, nullptr);
+      return false;
+    }
+
+    // --- Update decode descriptors ---
+    VkDescriptorBufferInfo srcBufInfo = {};
+    srcBufInfo.buffer = srcBuffer;
+    srcBufInfo.offset = srcOffset;
+    srcBufInfo.range  = VK_WHOLE_SIZE;
+
+    VkDescriptorBufferInfo scratchWriteInfo = {};
+    scratchWriteInfo.buffer = scratchBuffer;
+    scratchWriteInfo.offset = 0;
+    scratchWriteInfo.range  = VK_WHOLE_SIZE;
+
+    VkWriteDescriptorSet decodeWrites[2] = {};
+    decodeWrites[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    decodeWrites[0].dstSet          = decodeSet;
+    decodeWrites[0].dstBinding      = 0;
+    decodeWrites[0].descriptorCount = 1;
+    decodeWrites[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    decodeWrites[0].pBufferInfo     = &srcBufInfo;
+
+    decodeWrites[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    decodeWrites[1].dstSet          = decodeSet;
+    decodeWrites[1].dstBinding      = 1;
+    decodeWrites[1].descriptorCount = 1;
+    decodeWrites[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    decodeWrites[1].pBufferInfo     = &scratchWriteInfo;
+
+    s_vk.vkUpdateDescriptorSets(device, 2, decodeWrites, 0, nullptr);
+
+    // --- Update encode descriptors ---
+    VkDescriptorBufferInfo scratchReadInfo = {};
+    scratchReadInfo.buffer = scratchBuffer;
+    scratchReadInfo.offset = 0;
+    scratchReadInfo.range  = VK_WHOLE_SIZE;
+
+    VkDescriptorBufferInfo dstBufInfo = {};
+    dstBufInfo.buffer = dstBuffer;
+    dstBufInfo.offset = dstOffset;
+    dstBufInfo.range  = VK_WHOLE_SIZE;
+
+    VkDescriptorBufferInfo lut2BufInfo = {};
+    lut2BufInfo.buffer = lut2Buffer;
+    lut2BufInfo.offset = 0;
+    lut2BufInfo.range  = VK_WHOLE_SIZE;
+
+    VkDescriptorBufferInfo lutS2BufInfo = {};
+    lutS2BufInfo.buffer = lutS2Buffer;
+    lutS2BufInfo.offset = 0;
+    lutS2BufInfo.range  = VK_WHOLE_SIZE;
+
+    VkWriteDescriptorSet encodeWrites[4] = {};
+    for (int i = 0; i < 4; i++) {
+      encodeWrites[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      encodeWrites[i].dstSet          = encodeSet;
+      encodeWrites[i].dstBinding      = static_cast<uint32_t>(i);
+      encodeWrites[i].descriptorCount = 1;
+      encodeWrites[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    }
+    encodeWrites[0].pBufferInfo = &scratchReadInfo;
+    encodeWrites[1].pBufferInfo = &dstBufInfo;
+    encodeWrites[2].pBufferInfo = &lut2BufInfo;
+    encodeWrites[3].pBufferInfo = &lutS2BufInfo;
+
+    s_vk.vkUpdateDescriptorSets(device, 4, encodeWrites, 0, nullptr);
+
+    // ================================================================
+    // Begin command buffer
+    // ================================================================
+    VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vr = s_vk.vkBeginCommandBuffer(cmdBuf, &beginInfo);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkBeginCommandBuffer failed (", vr, ")"));
+      s_vk.vkDestroyFence(device, fence, nullptr);
+      s_vk.vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuf);
+      s_vk.vkDestroyCommandPool(device, cmdPool, nullptr);
+      return false;
+    }
+
+    // ================================================================
+    // Pass 1: BCn decode — srcBuffer → scratchBuffer
+    // ================================================================
+    s_vk.vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, decodePipeline);
+    s_vk.vkCmdBindDescriptorSets(cmdBuf,
+        VK_PIPELINE_BIND_POINT_COMPUTE, decodeLayout,
+        0, 1, &decodeSet, 0, nullptr);
+
+    // Push constants: {formatId, width, height} = 3 × uint32_t = 12 bytes
+    struct { uint32_t fmt; uint32_t w; uint32_t h; } decodePC = { formatId, width, height };
+    s_vk.vkCmdPushConstants(cmdBuf, decodeLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(decodePC), &decodePC);
+
+    s_vk.vkCmdDispatch(cmdBuf, blocksX, blocksY, 1);
+
+    // ================================================================
+    // Barrier: scratch buffer write → read (decode → encode)
+    // ================================================================
+    VkBufferMemoryBarrier scratchBarrier = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+    scratchBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    scratchBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    scratchBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    scratchBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    scratchBarrier.buffer  = scratchBuffer;
+    scratchBarrier.offset  = 0;
+    scratchBarrier.size    = VK_WHOLE_SIZE;
+
+    s_vk.vkCmdPipelineBarrier(cmdBuf,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 1, &scratchBarrier, 0, nullptr);
+
+    // ================================================================
+    // Pass 2: ASTC encode — scratchBuffer → dstBuffer
+    // ================================================================
+    s_vk.vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, encodePipeline);
+    s_vk.vkCmdBindDescriptorSets(cmdBuf,
+        VK_PIPELINE_BIND_POINT_COMPUTE, encodeLayout,
+        0, 1, &encodeSet, 0, nullptr);
+
+    // Push constants: {texWidth, texHeight, flags} = ivec2 + uint = 12 bytes
+    // flags: bit 1 = try_2p (try 2-partition mode), bit 2 = only_2p (force 2P)
+    struct { int32_t w; int32_t h; uint32_t flags; } encodePC;
+    encodePC.w     = static_cast<int32_t>(width);
+    encodePC.h     = static_cast<int32_t>(height);
+    encodePC.flags = 2u;  // bit 1 set → try 2P, compare MSE with 1P
+
+    s_vk.vkCmdPushConstants(cmdBuf, encodeLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(encodePC), &encodePC);
+
+    s_vk.vkCmdDispatch(cmdBuf, blocksX, blocksY, 1);
+
+    // ================================================================
+    // End command buffer
+    // ================================================================
+    vr = s_vk.vkEndCommandBuffer(cmdBuf);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkEndCommandBuffer failed (", vr, ")"));
+      s_vk.vkDestroyFence(device, fence, nullptr);
+      s_vk.vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuf);
+      s_vk.vkDestroyCommandPool(device, cmdPool, nullptr);
+      return false;
+    }
+
+    // ================================================================
+    // Submit with fence and wait
+    // ================================================================
+    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers    = &cmdBuf;
+
+    vr = s_vk.vkQueueSubmit(queue, 1, &submitInfo, fence);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkQueueSubmit failed (", vr, ")"));
+      s_vk.vkDestroyFence(device, fence, nullptr);
+      s_vk.vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuf);
+      s_vk.vkDestroyCommandPool(device, cmdPool, nullptr);
+      return false;
+    }
+
+    vr = s_vk.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkWaitForFences failed (", vr, ")"));
+    }
+
+    // Cleanup transient resources
+    s_vk.vkDestroyFence(device, fence, nullptr);
+    s_vk.vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuf);
+    s_vk.vkDestroyCommandPool(device, cmdPool, nullptr);
+
+    Logger::debug(str::format("Vegas TC: transcoded ", width, "x", height,
+                              " (", numBlocks, " blocks) BCn->ASTC"));
     return true;
   }
    *  Creates a private VkImage with STORAGE_BIT + TRANSFER_SRC_BIT.

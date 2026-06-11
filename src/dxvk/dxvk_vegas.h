@@ -273,6 +273,19 @@ namespace dxvk {
             uint32_t             width,
             uint32_t             height);
 
+    /// GPU-side BCn→ASTC transcoder (Approach A — independent queue submit).
+    /// Reads BCn compressed data from srcBuffer, writes ASTC 4×4 blocks to dstBuffer.
+    /// Uses a persistent scratch RGBA8 buffer internally (resized on demand).
+    /// \returns true if the GPU compute completed successfully.
+    static bool gpuTranscodeImageData(
+            VkBuffer             srcBuffer,
+            uint32_t             srcOffset,
+            VkBuffer             dstBuffer,
+            uint32_t             dstOffset,
+            VkFormat             srcFormat,
+            uint32_t             width,
+            uint32_t             height);
+
     /// Retrieve framegen output VkImage (interpolated intermediate frame).
     /// Note: framegenDispatch blits the output to curImage internally;
     /// this getter exists for debug/inspection only.
@@ -342,6 +355,11 @@ namespace dxvk {
     static uint64_t            s_tcLut2Memory;          ///< VkDeviceMemory
     static uint64_t            s_tcLutS2Buffer;         ///< VkBuffer (astc_2p_4x4_lut_s2)
     static uint64_t            s_tcLutS2Memory;         ///< VkDeviceMemory
+    // Transcoder scratch RGBA8 buffer (persistent, resized on demand)
+    static uint64_t            s_tcScratchBuffer;       ///< VkBuffer
+    static uint64_t            s_tcScratchMemory;       ///< VkDeviceMemory
+    static uint32_t            s_tcScratchW;            ///< current pixel width
+    static uint32_t            s_tcScratchH;            ///< current pixel height
 
     // ---- VegasHud metrics (updated by pushMetrics()) ----
     static constexpr uint32_t  FT_HISTORY_SIZE = 60;
