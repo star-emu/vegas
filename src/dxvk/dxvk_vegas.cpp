@@ -576,9 +576,9 @@ namespace dxvk {
   //      BCn data into staging buffer, call gpuTranscodeImageData()
   //      to convert BCn→ASTC in-place before the CS upload lambda.
   //
-  // Remaining gap: BC1/4 need a larger staging buffer (ASTC 4×4 is
-  // 16 B/block vs 8 B/block). Activate by extending the staging
-  // buffer allocation when originalFormat.elementSize < 16.
+  // BC1/BC4 gap closed: the D3D11 initializer now detects elementSize < 16
+  // and doubles the staging buffer allocation so that ASTC 4×4 output
+  // (16 B/block) fits without overflowing into adjacent mip levels.
   //
   // The CPU transcoder below is dead code (zero call sites) — kept as
   // a reference implementation for debugging the GPU pipeline.
