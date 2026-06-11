@@ -328,6 +328,21 @@ namespace dxvk {
     static uint32_t            s_fgMotionW;           ///< motion buffer width (blocks)
     static uint32_t            s_fgMotionH;           ///< motion buffer height (blocks)
 
+    // ---- GPU Transcoder resources (BCn→ASTC compute pipeline) ----
+    static uint64_t            s_tcDecodePipeline;      ///< VkPipeline (decode)
+    static uint64_t            s_tcEncodePipeline;      ///< VkPipeline (encode)
+    static uint64_t            s_tcDecodePipelineLayout;///< VkPipelineLayout
+    static uint64_t            s_tcEncodePipelineLayout;///< VkPipelineLayout
+    static uint64_t            s_tcDecodeDescLayout;    ///< VkDescriptorSetLayout
+    static uint64_t            s_tcEncodeDescLayout;    ///< VkDescriptorSetLayout
+    static uint64_t            s_tcDescPool;            ///< VkDescriptorPool
+    static bool                s_tcInitialized;
+    // Transcoder LUT SSBOs (persistent, filled once at init)
+    static uint64_t            s_tcLut2Buffer;          ///< VkBuffer (lut2_packed)
+    static uint64_t            s_tcLut2Memory;          ///< VkDeviceMemory
+    static uint64_t            s_tcLutS2Buffer;         ///< VkBuffer (astc_2p_4x4_lut_s2)
+    static uint64_t            s_tcLutS2Memory;         ///< VkDeviceMemory
+
     // ---- VegasHud metrics (updated by pushMetrics()) ----
     static constexpr uint32_t  FT_HISTORY_SIZE = 60;
     static float               s_ftHistory[FT_HISTORY_SIZE];

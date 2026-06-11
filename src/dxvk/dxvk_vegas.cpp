@@ -6,6 +6,12 @@
 #include "star_fsr_spv.h"
 #include "star_fg_spv.h"
 
+// GPU BCn→ASTC transcoder SPIR-V + LUT data
+#include "vegas_bcn_decode_spv.h"
+#include "vegas_astc_enc_spv.h"
+#include "vegas_astc_lut2_packed.h"
+#include "vegas_astc_lut_2p_4x4_s2.h"
+
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
@@ -71,6 +77,20 @@ namespace dxvk {
   uint64_t Vegas::s_fgDescSetLayout   = 0;
   uint64_t Vegas::s_fgDescPool        = 0;
   bool     Vegas::s_fgInitialized     = false;
+
+  // GPU Transcoder resources
+  uint64_t Vegas::s_tcDecodePipeline       = 0;
+  uint64_t Vegas::s_tcEncodePipeline       = 0;
+  uint64_t Vegas::s_tcDecodePipelineLayout = 0;
+  uint64_t Vegas::s_tcEncodePipelineLayout = 0;
+  uint64_t Vegas::s_tcDecodeDescLayout     = 0;
+  uint64_t Vegas::s_tcEncodeDescLayout     = 0;
+  uint64_t Vegas::s_tcDescPool             = 0;
+  bool     Vegas::s_tcInitialized          = false;
+  uint64_t Vegas::s_tcLut2Buffer           = 0;
+  uint64_t Vegas::s_tcLut2Memory           = 0;
+  uint64_t Vegas::s_tcLutS2Buffer          = 0;
+  uint64_t Vegas::s_tcLutS2Memory          = 0;
 
   // Framegen intermediate images
   bool     Vegas::s_fgPrevValid       = false;
@@ -1141,6 +1161,13 @@ namespace dxvk {
       PFN_vkCmdBlitImage              vkCmdBlitImage              = nullptr;
       // Physical-device-level (loaded separately)
       PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties = nullptr;
+      // Buffer functions for LUT SSBOs (transcoder)
+      PFN_vkCreateBuffer              vkCreateBuffer              = nullptr;
+      PFN_vkDestroyBuffer             vkDestroyBuffer             = nullptr;
+      PFN_vkGetBufferMemoryRequirements vkGetBufferMemoryRequirements = nullptr;
+      PFN_vkBindBufferMemory          vkBindBufferMemory          = nullptr;
+      PFN_vkMapMemory                 vkMapMemory                 = nullptr;
+      PFN_vkUnmapMemory               vkUnmapMemory               = nullptr;
       bool                         loaded                   = false;
     };
 
@@ -1215,6 +1242,13 @@ namespace dxvk {
       VK_LOAD_DEV_FUNC(vkFreeMemory)
       VK_LOAD_DEV_FUNC(vkBindImageMemory)
       VK_LOAD_DEV_FUNC(vkCmdBlitImage)
+      // Buffer functions for LUT SSBOs (transcoder)
+      VK_LOAD_DEV_FUNC(vkCreateBuffer)
+      VK_LOAD_DEV_FUNC(vkDestroyBuffer)
+      VK_LOAD_DEV_FUNC(vkGetBufferMemoryRequirements)
+      VK_LOAD_DEV_FUNC(vkBindBufferMemory)
+      VK_LOAD_DEV_FUNC(vkMapMemory)
+      VK_LOAD_DEV_FUNC(vkUnmapMemory)
 #     undef VK_LOAD_DEV_FUNC
 
       // Load physical-device-level functions via dlsym (not vkGetDeviceProcAddr)
@@ -1367,7 +1401,425 @@ namespace dxvk {
   }
 
 
-  /** Ensure FSR intermediate image exists at the given dimensions.
+  // ================================================================
+  // GPU Transcoder — BCn→ASTC compute pipeline (Approach A)
+  // ================================================================
+  //
+  // Two-pass compute pipeline:
+  //   Pass 1: vegas_bcn_decode.comp — BCn compressed → RGBA8 u32 texels
+  //   Pass 2: astc_enc_leegao.comp  — RGBA8 → ASTC 4×4 blocks (PCA quality)
+  //
+  // Both shaders dispatch at ceil(w/4) × ceil(h/4) workgroups, share the
+  // same per-pixel buffer format (uint = R|G<<8|B<<16|A<<24), and use
+  // 4×4 block size — so ASTC 4×4 maps 1:1 to BCn 4×4 with no alignment
+  // issues.
+  //
+  // Architecture: Independent queue submit (FSR pattern — Approach A).
+  // Creates transient command buffer, records both dispatches + barrier,
+  // submits, waits. No DXVK internal state touched.
+  // ================================================================
+
+  /** Create a host-visible SSBO filled with static data (LUTs).
+   *  \returns true on success; buffer and memory handles set to non-zero. */
+  static bool createStaticSsbo(
+      VkDevice             device,
+      const void*          data,
+      VkDeviceSize         size,
+      VkBuffer&            buffer,
+      VkDeviceMemory&      memory) {
+    VkBufferCreateInfo bufCI = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bufCI.size        = size;
+    bufCI.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bufCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkResult vr = s_vk.vkCreateBuffer(device, &bufCI, nullptr, &buffer);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkCreateBuffer (", size, " bytes) failed (", vr, ")"));
+      buffer = VK_NULL_HANDLE;
+      return false;
+    }
+
+    VkMemoryRequirements memReqs;
+    s_vk.vkGetBufferMemoryRequirements(device, buffer, &memReqs);
+
+    VkPhysicalDevice physDev = reinterpret_cast<VkPhysicalDevice>(Vegas::s_physicalDevice);
+    VkPhysicalDeviceMemoryProperties physMemProps;
+    s_vk.vkGetPhysicalDeviceMemoryProperties(physDev, &physMemProps);
+
+    uint32_t memTypeIdx = UINT32_MAX;
+    for (uint32_t i = 0; i < physMemProps.memoryTypeCount; ++i) {
+      if ((memReqs.memoryTypeBits & (1u << i)) &&
+          (physMemProps.memoryTypes[i].propertyFlags &
+           (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+           == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+        memTypeIdx = i;
+        break;
+      }
+    }
+
+    if (memTypeIdx == UINT32_MAX) {
+      // Fallback: any compatible type
+      for (uint32_t i = 0; i < physMemProps.memoryTypeCount; ++i) {
+        if (memReqs.memoryTypeBits & (1u << i)) {
+          memTypeIdx = i;
+          break;
+        }
+      }
+    }
+
+    if (memTypeIdx == UINT32_MAX) {
+      Logger::warn("Vegas TC: no compatible memory type for LUT SSBO");
+      s_vk.vkDestroyBuffer(device, buffer, nullptr);
+      buffer = VK_NULL_HANDLE;
+      return false;
+    }
+
+    VkMemoryAllocateInfo allocCI = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    allocCI.allocationSize  = memReqs.size;
+    allocCI.memoryTypeIndex = memTypeIdx;
+
+    vr = s_vk.vkAllocateMemory(device, &allocCI, nullptr, &memory);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkAllocateMemory (LUT) failed (", vr, ")"));
+      s_vk.vkDestroyBuffer(device, buffer, nullptr);
+      buffer = VK_NULL_HANDLE;
+      memory = VK_NULL_HANDLE;
+      return false;
+    }
+
+    vr = s_vk.vkBindBufferMemory(device, buffer, memory, 0);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkBindBufferMemory (LUT) failed (", vr, ")"));
+      s_vk.vkFreeMemory(device, memory, nullptr);
+      s_vk.vkDestroyBuffer(device, buffer, nullptr);
+      buffer = VK_NULL_HANDLE;
+      memory = VK_NULL_HANDLE;
+      return false;
+    }
+
+    // Map, copy, unmap
+    void* mapped = nullptr;
+    vr = s_vk.vkMapMemory(device, memory, 0, size, 0, &mapped);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkMapMemory (LUT) failed (", vr, ")"));
+      s_vk.vkFreeMemory(device, memory, nullptr);
+      s_vk.vkDestroyBuffer(device, buffer, nullptr);
+      buffer = VK_NULL_HANDLE;
+      memory = VK_NULL_HANDLE;
+      return false;
+    }
+    std::memcpy(mapped, data, static_cast<size_t>(size));
+    s_vk.vkUnmapMemory(device, memory);
+
+    Logger::debug(str::format("Vegas TC: LUT SSBO created (", size, " bytes)"));
+    return true;
+  }
+
+
+  /** Initialize GPU transcoder pipelines + LUT SSBOs.
+   *  Idempotent — safe to call multiple times. */
+  static bool initTranscoderPipeline(VkDevice device) {
+    if (Vegas::s_tcInitialized)
+      return Vegas::s_tcDecodePipeline != 0;
+
+    VkResult vr;
+
+    // ================================================================
+    // 1. Create LUT SSBOs (persistent, host-visible, read-only on GPU)
+    // ================================================================
+    VkBuffer lut2Buffer = VK_NULL_HANDLE;
+    VkDeviceMemory lut2Memory = VK_NULL_HANDLE;
+    if (!createStaticSsbo(device, vegas_astc_lut2_packed,
+            sizeof(vegas_astc_lut2_packed), lut2Buffer, lut2Memory)) {
+      Vegas::s_tcInitialized = true;
+      return false;
+    }
+
+    VkBuffer lutS2Buffer = VK_NULL_HANDLE;
+    VkDeviceMemory lutS2Memory = VK_NULL_HANDLE;
+    if (!createStaticSsbo(device, vegas_astc_lut_2p_4x4_s2,
+            sizeof(vegas_astc_lut_2p_4x4_s2), lutS2Buffer, lutS2Memory)) {
+      s_vk.vkDestroyBuffer(device, lut2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lut2Memory, nullptr);
+      Vegas::s_tcInitialized = true;
+      return false;
+    }
+
+    // ================================================================
+    // 2. Decode shader module (vegas_bcn_decode.comp)
+    // ================================================================
+    VkShaderModuleCreateInfo smCI = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    smCI.codeSize = sizeof(vegas_bcn_decode_code);
+    smCI.pCode    = vegas_bcn_decode_code;
+
+    VkShaderModule decodeSM = VK_NULL_HANDLE;
+    vr = s_vk.vkCreateShaderModule(device, &smCI, nullptr, &decodeSM);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkCreateShaderModule (decode) failed (", vr, ")"));
+      s_vk.vkDestroyBuffer(device, lutS2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lutS2Memory, nullptr);
+      s_vk.vkDestroyBuffer(device, lut2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lut2Memory, nullptr);
+      Vegas::s_tcInitialized = true;
+      return false;
+    }
+
+    // ================================================================
+    // 3. Decode descriptor set layout
+    //    Binding 0: SSBO read  (BCn src data)
+    //    Binding 1: SSBO write (RGBA8 pixel output)
+    // ================================================================
+    VkDescriptorSetLayoutBinding decodeBindings[2] = {};
+    decodeBindings[0].binding         = 0;
+    decodeBindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    decodeBindings[0].descriptorCount = 1;
+    decodeBindings[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    decodeBindings[1].binding         = 1;
+    decodeBindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    decodeBindings[1].descriptorCount = 1;
+    decodeBindings[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo dslCI = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    dslCI.bindingCount = 2;
+    dslCI.pBindings    = decodeBindings;
+
+    VkDescriptorSetLayout decodeDSL = VK_NULL_HANDLE;
+    vr = s_vk.vkCreateDescriptorSetLayout(device, &dslCI, nullptr, &decodeDSL);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkCreateDescriptorSetLayout (decode) failed (", vr, ")"));
+      s_vk.vkDestroyShaderModule(device, decodeSM, nullptr);
+      s_vk.vkDestroyBuffer(device, lutS2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lutS2Memory, nullptr);
+      s_vk.vkDestroyBuffer(device, lut2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lut2Memory, nullptr);
+      Vegas::s_tcInitialized = true;
+      return false;
+    }
+
+    // ================================================================
+    // 4. Decode pipeline layout (push constant: formatID + texSize)
+    // ================================================================
+    VkPushConstantRange decodePCRange = {};
+    decodePCRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    decodePCRange.offset     = 0;
+    decodePCRange.size       = 12;  // uint formatID + uint texWidth + uint texHeight
+
+    VkPipelineLayoutCreateInfo plCI = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plCI.setLayoutCount         = 1;
+    plCI.pSetLayouts            = &decodeDSL;
+    plCI.pushConstantRangeCount = 1;
+    plCI.pPushConstantRanges    = &decodePCRange;
+
+    VkPipelineLayout decodePL = VK_NULL_HANDLE;
+    vr = s_vk.vkCreatePipelineLayout(device, &plCI, nullptr, &decodePL);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkCreatePipelineLayout (decode) failed (", vr, ")"));
+      s_vk.vkDestroyDescriptorSetLayout(device, decodeDSL, nullptr);
+      s_vk.vkDestroyShaderModule(device, decodeSM, nullptr);
+      s_vk.vkDestroyBuffer(device, lutS2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lutS2Memory, nullptr);
+      s_vk.vkDestroyBuffer(device, lut2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lut2Memory, nullptr);
+      Vegas::s_tcInitialized = true;
+      return false;
+    }
+
+    // ================================================================
+    // 5. Decode compute pipeline
+    // ================================================================
+    VkPipelineShaderStageCreateInfo ssCI = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+    ssCI.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    ssCI.module = decodeSM;
+    ssCI.pName  = "main";
+
+    VkComputePipelineCreateInfo cpCI = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    cpCI.stage  = ssCI;
+    cpCI.layout = decodePL;
+
+    VkPipeline decodePipeline = VK_NULL_HANDLE;
+    vr = s_vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpCI, nullptr, &decodePipeline);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkCreateComputePipelines (decode) failed (", vr, ")"));
+      s_vk.vkDestroyPipelineLayout(device, decodePL, nullptr);
+      s_vk.vkDestroyDescriptorSetLayout(device, decodeDSL, nullptr);
+      s_vk.vkDestroyShaderModule(device, decodeSM, nullptr);
+      s_vk.vkDestroyBuffer(device, lutS2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lutS2Memory, nullptr);
+      s_vk.vkDestroyBuffer(device, lut2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lut2Memory, nullptr);
+      Vegas::s_tcInitialized = true;
+      return false;
+    }
+
+    // Shader module no longer needed after pipeline creation
+    s_vk.vkDestroyShaderModule(device, decodeSM, nullptr);
+    decodeSM = VK_NULL_HANDLE;
+
+    // ================================================================
+    // 6. Encode shader module (astc_enc_leegao.comp)
+    // ================================================================
+    smCI.codeSize = sizeof(vegas_astc_enc_code);
+    smCI.pCode    = vegas_astc_enc_code;
+
+    VkShaderModule encodeSM = VK_NULL_HANDLE;
+    vr = s_vk.vkCreateShaderModule(device, &smCI, nullptr, &encodeSM);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkCreateShaderModule (encode) failed (", vr, ")"));
+      s_vk.vkDestroyPipeline(device, decodePipeline, nullptr);
+      s_vk.vkDestroyPipelineLayout(device, decodePL, nullptr);
+      s_vk.vkDestroyDescriptorSetLayout(device, decodeDSL, nullptr);
+      s_vk.vkDestroyBuffer(device, lutS2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lutS2Memory, nullptr);
+      s_vk.vkDestroyBuffer(device, lut2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lut2Memory, nullptr);
+      Vegas::s_tcInitialized = true;
+      return false;
+    }
+
+    // ================================================================
+    // 7. Encode descriptor set layout
+    //    Binding 0: SSBO read  (RGBA8 pixel input)
+    //    Binding 1: SSBO write (ASTC block output)
+    //    Binding 2: SSBO read  (lut2_packed — partition pattern LUT)
+    //    Binding 3: SSBO read  (astc_2p_4x4_lut_s2 — 2-plane seed LUT)
+    // ================================================================
+    VkDescriptorSetLayoutBinding encodeBindings[4] = {};
+    for (int i = 0; i < 4; i++) {
+      encodeBindings[i].binding         = static_cast<uint32_t>(i);
+      encodeBindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      encodeBindings[i].descriptorCount = 1;
+      encodeBindings[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+
+    dslCI.bindingCount = 4;
+    dslCI.pBindings    = encodeBindings;
+
+    VkDescriptorSetLayout encodeDSL = VK_NULL_HANDLE;
+    vr = s_vk.vkCreateDescriptorSetLayout(device, &dslCI, nullptr, &encodeDSL);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkCreateDescriptorSetLayout (encode) failed (", vr, ")"));
+      s_vk.vkDestroyShaderModule(device, encodeSM, nullptr);
+      s_vk.vkDestroyPipeline(device, decodePipeline, nullptr);
+      s_vk.vkDestroyPipelineLayout(device, decodePL, nullptr);
+      s_vk.vkDestroyDescriptorSetLayout(device, decodeDSL, nullptr);
+      s_vk.vkDestroyBuffer(device, lutS2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lutS2Memory, nullptr);
+      s_vk.vkDestroyBuffer(device, lut2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lut2Memory, nullptr);
+      Vegas::s_tcInitialized = true;
+      return false;
+    }
+
+    // ================================================================
+    // 8. Encode pipeline layout (push constant: texDim + flags)
+    // ================================================================
+    VkPushConstantRange encodePCRange = {};
+    encodePCRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    encodePCRange.offset     = 0;
+    encodePCRange.size       = 12;  // ivec2 texDim + uint flags
+
+    plCI.setLayoutCount         = 1;
+    plCI.pSetLayouts            = &encodeDSL;
+    plCI.pushConstantRangeCount = 1;
+    plCI.pPushConstantRanges    = &encodePCRange;
+
+    VkPipelineLayout encodePL = VK_NULL_HANDLE;
+    vr = s_vk.vkCreatePipelineLayout(device, &plCI, nullptr, &encodePL);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkCreatePipelineLayout (encode) failed (", vr, ")"));
+      s_vk.vkDestroyDescriptorSetLayout(device, encodeDSL, nullptr);
+      s_vk.vkDestroyShaderModule(device, encodeSM, nullptr);
+      s_vk.vkDestroyPipeline(device, decodePipeline, nullptr);
+      s_vk.vkDestroyPipelineLayout(device, decodePL, nullptr);
+      s_vk.vkDestroyDescriptorSetLayout(device, decodeDSL, nullptr);
+      s_vk.vkDestroyBuffer(device, lutS2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lutS2Memory, nullptr);
+      s_vk.vkDestroyBuffer(device, lut2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lut2Memory, nullptr);
+      Vegas::s_tcInitialized = true;
+      return false;
+    }
+
+    // ================================================================
+    // 9. Encode compute pipeline
+    // ================================================================
+    ssCI.module = encodeSM;
+    ssCI.pName  = "main";
+    cpCI.layout = encodePL;
+
+    VkPipeline encodePipeline = VK_NULL_HANDLE;
+    vr = s_vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpCI, nullptr, &encodePipeline);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkCreateComputePipelines (encode) failed (", vr, ")"));
+      s_vk.vkDestroyShaderModule(device, encodeSM, nullptr);
+      s_vk.vkDestroyPipelineLayout(device, encodePL, nullptr);
+      s_vk.vkDestroyDescriptorSetLayout(device, encodeDSL, nullptr);
+      s_vk.vkDestroyPipeline(device, decodePipeline, nullptr);
+      s_vk.vkDestroyPipelineLayout(device, decodePL, nullptr);
+      s_vk.vkDestroyDescriptorSetLayout(device, decodeDSL, nullptr);
+      s_vk.vkDestroyBuffer(device, lutS2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lutS2Memory, nullptr);
+      s_vk.vkDestroyBuffer(device, lut2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lut2Memory, nullptr);
+      Vegas::s_tcInitialized = true;
+      return false;
+    }
+
+    // Shader module no longer needed after pipeline creation
+    s_vk.vkDestroyShaderModule(device, encodeSM, nullptr);
+    encodeSM = VK_NULL_HANDLE;
+
+    // ================================================================
+    // 10. Shared descriptor pool
+    //     Max 2 sets (decode + encode), up to 6 storage buffers total
+    // ================================================================
+    VkDescriptorPoolSize tcPoolSize = {};
+    tcPoolSize.type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    tcPoolSize.descriptorCount = 6;  // 2 (decode) + 4 (encode)
+
+    VkDescriptorPoolCreateInfo dpCI = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    dpCI.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    dpCI.maxSets       = 2;
+    dpCI.poolSizeCount = 1;
+    dpCI.pPoolSizes    = &tcPoolSize;
+
+    VkDescriptorPool descPool = VK_NULL_HANDLE;
+    vr = s_vk.vkCreateDescriptorPool(device, &dpCI, nullptr, &descPool);
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("Vegas TC: vkCreateDescriptorPool failed (", vr, ")"));
+      s_vk.vkDestroyPipeline(device, encodePipeline, nullptr);
+      s_vk.vkDestroyPipelineLayout(device, encodePL, nullptr);
+      s_vk.vkDestroyDescriptorSetLayout(device, encodeDSL, nullptr);
+      s_vk.vkDestroyPipeline(device, decodePipeline, nullptr);
+      s_vk.vkDestroyPipelineLayout(device, decodePL, nullptr);
+      s_vk.vkDestroyDescriptorSetLayout(device, decodeDSL, nullptr);
+      s_vk.vkDestroyBuffer(device, lutS2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lutS2Memory, nullptr);
+      s_vk.vkDestroyBuffer(device, lut2Buffer, nullptr);
+      s_vk.vkFreeMemory(device, lut2Memory, nullptr);
+      Vegas::s_tcInitialized = true;
+      return false;
+    }
+
+    // ================================================================
+    // 11. Store all handles
+    // ================================================================
+    Vegas::s_tcDecodePipeline       = reinterpret_cast<uint64_t>(decodePipeline);
+    Vegas::s_tcEncodePipeline       = reinterpret_cast<uint64_t>(encodePipeline);
+    Vegas::s_tcDecodePipelineLayout = reinterpret_cast<uint64_t>(decodePL);
+    Vegas::s_tcEncodePipelineLayout = reinterpret_cast<uint64_t>(encodePL);
+    Vegas::s_tcDecodeDescLayout     = reinterpret_cast<uint64_t>(decodeDSL);
+    Vegas::s_tcEncodeDescLayout     = reinterpret_cast<uint64_t>(encodeDSL);
+    Vegas::s_tcDescPool             = reinterpret_cast<uint64_t>(descPool);
+    Vegas::s_tcLut2Buffer           = reinterpret_cast<uint64_t>(lut2Buffer);
+    Vegas::s_tcLut2Memory           = reinterpret_cast<uint64_t>(lut2Memory);
+    Vegas::s_tcLutS2Buffer          = reinterpret_cast<uint64_t>(lutS2Buffer);
+    Vegas::s_tcLutS2Memory          = reinterpret_cast<uint64_t>(lutS2Memory);
+    Vegas::s_tcInitialized          = true;
+
+    Logger::debug("Vegas TC: GPU transcoder pipelines initialized");
+    return true;
+  }
    *  Creates a private VkImage with STORAGE_BIT + TRANSFER_SRC_BIT.
    *  Destroys and recreates if dimensions changed (swapchain resize). */
   static bool ensureFsrIntermediate(VkDevice device, VkExtent3D extent) {
