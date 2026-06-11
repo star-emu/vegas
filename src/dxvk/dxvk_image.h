@@ -22,6 +22,11 @@ namespace dxvk {
     /// Pixel format
     VkFormat format = VK_FORMAT_UNDEFINED;
     
+    /// Original pixel format before VEGAS BCn→ASTC format swap.
+    /// Set by DxvkDevice::createImage when shouldTranscodeFormat
+    /// returns an ASTC replacement. VK_FORMAT_UNDEFINED = no swap.
+    VkFormat originalFormat = VK_FORMAT_UNDEFINED;
+    
     /// Flags
     VkImageCreateFlags flags = 0u;
     

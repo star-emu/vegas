@@ -242,15 +242,28 @@ namespace dxvk {
   Rc<DxvkImage> DxvkDevice::createImage(
     const DxvkImageCreateInfo&  createInfo,
           VkMemoryPropertyFlags memoryType) {
-    // --- VEGAS: BCn→ASTC transcoding check (GATED) ---
-    // The shouldTranscodeFormat call is kept for future wiring but the
-    // per-image log was removed — it produced thousands of lines in every
-    // game with no actionable outcome since the upload transcoder is gated.
-    // See the "CPU-side BCn->ASTC transcoder" block comment in dxvk_vegas.cpp.
-    // When the transcoder is activated, re-add a rate-limited log here.
+    // --- VEGAS: BCn→ASTC GPU transcoding format swap ---
+    DxvkImageCreateInfo info = createInfo;
+
+    VkFormat astcFormat = Vegas::shouldTranscodeFormat(
+      info.format, info.usage, info.extent, m_adapter);
+
+    if (astcFormat != VK_FORMAT_UNDEFINED) {
+      info.originalFormat = info.format;
+      info.format         = astcFormat;
+
+#ifndef NDEBUG
+      if (dxvk::Logger::logLevel() >= dxvk::LogLevel::Debug) {
+        Logger::debug(str::format(
+          "VEGAS: transcode ", info.originalFormat, " -> ",
+          info.format, " (", info.extent.width, "x",
+          info.extent.height, ")"));
+      }
+#endif
+    }
     // --- END VEGAS ---
 
-    return new DxvkImage(this, createInfo, m_objects.memoryManager(), memoryType);
+    return new DxvkImage(this, info, m_objects.memoryManager(), memoryType);
   }
   
   
