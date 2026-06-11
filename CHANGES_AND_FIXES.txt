@@ -3,7 +3,7 @@
   Game Stability & Performance on Adreno GPUs (Turnip Driver)
 ═══════════════════════════════════════════════════════════════
 
-Last updated: 2026-06-05  |  Branch: vegas  |  Commit: 5b7bcd5
+Last updated: 2026-06-11  |  Branch: release-v2  |  Commit: 19c9a86
 
 ───────────────────────────────────────────────────────────────
 TABLE OF CONTENTS
@@ -15,7 +15,8 @@ TABLE OF CONTENTS
   5. Governor & Adaptive Thresholds (Performance)
   6. GPU Pacing (General)
   7. Tier Classification (Compatibility)
-  8. Logging Cleanup (Diagnostics)
+   8. Logging Cleanup (Diagnostics)
+   9. GPU BCn→ASTC Transcoder (release-v2)
 ───────────────────────────────────────────────────────────────
 
 
@@ -348,11 +349,92 @@ TABLE OF CONTENTS
     "Vegas: Perf=... ftRatio=1.2 load=0.85 frameTime=20.0ms"
   Enables live monitoring of governor decisions.
 
+   Result:
+     • Clean logs: ~10 lines per session instead of 3000+
+     • Actionable diagnostics: tier, thresholds, ftRatio, load
+     • Performance monitoring without log spam
+     • Easier troubleshooting for users
+
+
+┌─────────────────────────────────────────────────────────────┐
+│  9. GPU BCn→ASTC TRANSCODER  —  release-v2 branch          │
+└─────────────────────────────────────────────────────────────┘
+
+  Problem:
+    BCn-compressed textures (BC1–BC7) cannot be uploaded directly to
+    ASTC-formatted Vulkan images. DXVK's `createImage()` swaps the
+    image format to ASTC 4×4 on Adreno (where ASTC decode is available
+    via Turnip), but the staging buffer still contains BCn data — the
+    bytes must be transcoded before the upload copy.
+
+    The original VEGAS CPU transcoder (`transcodeImageData()`) decoded
+    BCn→RGBA8 on the CPU and re-encoded with a simplified ASTC encoder,
+    taking 5.5–22 ms per mip/layer. It was never wired into the upload
+    path because the CPU cost was prohibitive.
+
+  Fix (Batches 1–5, commits 22d4ba5 → 19c9a86 on release-v2):
+    ─────────────────────────────────────────────────────
+    Replaced the gated CPU transcoder with an active two-pass GPU
+    compute pipeline that runs on-device before upload:
+      Pass 1: vegas_bcn_decode.comp — BCn→RGBA8 (scratch SSBO)
+      Pass 2: astc_enc_leegao.comp  — RGBA8→ASTC 4×4 (PCA-based,
+               2-partition mode support; LUTs from SSBOs)
+    ─────────────────────────────────────────────────────
+
+    Pipeline details:
+    • Both shaders dispatch at ceil(w/4) × ceil(h/4) workgroups
+    • Persistent RGBA8 scratch buffer (grow-only)
+    • Independent submit + fence wait (Approach A — no DXVK state touched)
+    • Lazy pipeline creation on first call
+
+    Integration (3-file change):
+    1. src/dxvk/dxvk_image.h — DxvkImageCreateInfo::originalFormat field
+    2. src/dxvk/dxvk_device.cpp — createImage() swaps format if eligible
+    3. src/d3d11/d3d11_initializer.cpp — transcodes after pack, before upload
+
+    BC1/BC4 staging fix (Batch 5):
+      BC1/BC4 use 8 B/block → ASTC 4×4 uses 16 B/block. The staging
+      buffer must be allocated at 2× per-layer size so the transcoder
+      output doesn't overflow into the next mip. Fixed by detecting
+      elementSize < 16 and doubling the allocation + strides.
+
   Result:
-    • Clean logs: ~10 lines per session instead of 3000+
-    • Actionable diagnostics: tier, thresholds, ftRatio, load
-    • Performance monitoring without log spam
-    • Easier troubleshooting for users
+    • All BC1–BC7 textures transcoded to ASTC 4×4 before GPU upload
+    • ~0.15–0.26 ms per mip/layer (vs 5.5–22 ms CPU)
+    • In-place staging for BC3/BC5/BC7 (same 16 B/block)
+    • 2× staging for BC1/BC4 (8→16 B/block expansion)
+    • Zero DXVK CS thread contention (independent submit)
+    • Fail-safe: returns false on error, game continues
+
+  Commits (in order):
+    22d4ba5  Step 1 — BCn decode shader SPV
+    41bb85b  Step 2 — leegao's ASTC encoder SPV + LUTs
+    fc06f55  Batch 1/5 — pipeline init (createStaticSsbo,
+             initTranscoderPipeline)
+    766b8c1  Batch 2/5 — gpuTranscodeImageData dispatch
+    bb7b8b1  Batch 3/5 — format swap in createImage
+    12b00bb  Batch 4/5 — upload path + getAstcFormat 4×4 fix
+    19c9a86  Batch 5/5 — BC1/BC4 staging buffer resize
+
+  Credits:
+    • astc_enc_leegao.comp — leegao's PCA-based GPU encoder
+    • vegas_bcn_decode.comp — custom BCn decode shader by isygold
+    • Pipeline integration, format swap, upload wiring — isygold
+
+  Affected files:
+    src/d3d11/d3d11_initializer.cpp
+    src/dxvk/dxvk_device.cpp
+    src/dxvk/dxvk_image.h
+    src/dxvk/dxvk_vegas.cpp
+    src/dxvk/dxvk_vegas.h
+    src/dxvk/shaders/vegas_bcn_decode.comp
+    src/dxvk/shaders/astc_enc_leegao.comp
+    src/dxvk/vegas_astc_lut2_packed.h
+    src/dxvk/vegas_astc_lut_2p_4x4_s2.h
+
+  Applicable to:
+    All Adreno GPUs running Mesa Turnip (ASTC decode support required);
+    no benefit on Qualcomm proprietary blob (no ASTC decode).
 
 
 ═══════════════════════════════════════════════════════════════
@@ -388,6 +470,13 @@ ROLLBACK GUIDE
     dxvk.enableStarProfile = False  # Disable ALL Vegas features
 
   Or revert specific commits:
+    git revert 19c9a86   # Revert Batch 5/5 — BC1/BC4 staging resize
+    git revert 12b00bb   # Revert Batch 4/5 — upload path + getAstcFormat
+    git revert bb7b8b1   # Revert Batch 3/5 — format swap in createImage
+    git revert 766b8c1   # Revert Batch 2/5 — gpuTranscodeImageData
+    git revert fc06f55   # Revert Batch 1/5 — pipeline init
+    git revert 41bb85b   # Revert Step 2 — ASTC encoder + LUTs
+    git revert 22d4ba5   # Revert Step 1 — BCn decode shader
     git revert 5b7bcd5   # Revert bleeding-edge upgrades
     git revert a8c994e   # Revert Phase 1 changes
     git revert 1fe8861   # Revert GPL+async fix

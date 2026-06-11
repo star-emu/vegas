@@ -58,16 +58,20 @@ GPU pacing, and HUD rendering — all gated behind a single master switch
  │  dxvk_shader_cache.cpp       │  periodic cache flush
  │  dxvk_swapchain_blitter.cpp  │  HUD composition (DXVK upstream path only)
  ├──────────────────────────────┤
- │  dxvk_vegas.cpp              │  ALL feature logic, decision helpers,
- │  dxvk_vegas.h                │  metrics push + FT history ring buffer
- │  hud/dxvk_hud_item.cpp       │  Frametime graph with Vegas perf colors
- │  hud/shaders/hud_graph_frag  │  Dynamic line_color from push constant
- │  dxvk_fence.h/.cpp           │  DxvkFence timeline semaphore (leegao)
- │  dxvk_options.h/.cpp         │  config option declarations
- ├──────────────────────────────┤
- │  star_fsr_spv.h              │  FSR 1.0 EASU SPIR-V
- │  star_fg_spv.h               │  Framegen 3-pass SPIR-V
- └──────────────────────────────┘
+│  dxvk_vegas.cpp              │  ALL feature logic, decision helpers,
+│  dxvk_vegas.h                │  metrics push + FT history ring buffer,
+│                              │  GPU BCn→ASTC transcoder (gpuTranscodeImageData)
+│  hud/dxvk_hud_item.cpp       │  Frametime graph with Vegas perf colors
+│  hud/shaders/hud_graph_frag  │  Dynamic line_color from push constant
+│  dxvk_fence.h/.cpp           │  DxvkFence timeline semaphore (leegao)
+│  dxvk_options.h/.cpp         │  config option declarations
+├──────────────────────────────┤
+│  star_fsr_spv.h              │  FSR 1.0 EASU SPIR-V
+│  star_fg_spv.h               │  Framegen 3-pass SPIR-V
+│  vegas_bcn_decode_spv.h      │  BCn→RGBA8 decode SPIR-V
+│  vegas_astc_enc_spv.h        │  leegao's ASTC 4×4 encode SPIR-V
+│  vegas_astc_lut*.h           │  ASTC encoder lookup tables (47 KB)
+└──────────────────────────────┘
 ```
 
 ### Data Flow
@@ -151,6 +155,10 @@ Per-Submit (submitCommandList):
 |------|---------|
 | `src/dxvk/star_fsr_spv.h` | FSR 1.0 EASU compute shader (dxvk_fsr_easu_code[]) |
 | `src/dxvk/star_fg_spv.h` | 3-pass framegen shaders: dxvk_fg_motion_code[], dxvk_fg_median_code[], dxvk_fg_warp_code[] |
+| `src/dxvk/vegas_bcn_decode_spv.h` | BCn→RGBA8 decode compute shader (BC1–BC7, 4×4 block) |
+| `src/dxvk/vegas_astc_enc_spv.h` | leegao's PCA-based RGBA8→ASTC 4×4 encoder (2-partition mode support) |
+| `src/dxvk/vegas_astc_lut2_packed.h` | ASTC 2-partition weight LUT (4 KB SSBO data) |
+| `src/dxvk/vegas_astc_lut_2p_4x4_s2.h` | ASTC 2-partition pattern LUT (43 KB SSBO data) |
 
 ---
 
@@ -416,35 +424,110 @@ fail-closed on any error.
 
 ---
 
-### 3.11 BCn→ASTC Transcoder (Gated)
+### 3.11 GPU BCn→ASTC Transcoder (Active on `release-v2`)
 
-**File:** `src/dxvk/dxvk_vegas.cpp`
+**File:** `src/dxvk/dxvk_vegas.cpp`, `src/d3d11/d3d11_initializer.cpp`
 
-**Status:** ⚠️ GATED — code is implemented but NOT wired into the upload pipeline.
-See comment at lines 499-518 for rationale.
+**Status:** ✅ ACTIVE on `release-v2` branch. All BC1–BC7 formats are
+transcoded to ASTC 4×4 via a two-pass GPU compute pipeline before upload.
 
 | Component | Lines | Purpose |
 |-----------|-------|---------|
 | `formatIsBcn(VkFormat)` | 387-409 | Returns true for all 16 BCn formats |
-| `getAstcFormat(VkFormat)` | 411-449 | Maps BCn→ASTC (BC1→6×6, BC2/3/5/7→5×5, BC4→6×6) |
-| `shouldTranscodeFormat(...)` | 456-487 | Returns ASTC format if eligible (usage, size, support checks) |
-| `decodeBC1(...)` | 523-549 | CPU decoder for BC1 (4×4 from 8 bytes) |
-| `decodeBC3(...)` | 574-580 | CPU decoder for BC3 (BC1 + BC4 alpha) |
-| `decodeBC4(...)` | 570-572 | CPU decoder for BC4 (single-channel) |
-| `decodeBC5(...)` | 582-590 | CPU decoder for BC5 (two-channel) |
-| `decodeBC7(...)` | 592-619 | CPU decoder for BC7 (mode 0) |
-| `encodeAstcBlock(...)` | 684-775 | Simplified ASTC encoder (1 partition, LDR) |
-| `transcodeImageData(...)` | 779-886 | Full BCn→ASTC conversion: decode→pixels→encode |
+| `getAstcFormat(VkFormat)` | 478-510 | Maps BC1–BC7 → **ASTC 4×4 exclusively** |
+| `shouldTranscodeFormat(...)` | 512-555 | Returns ASTC format if eligible (usage, size, support, not already ASTC) |
+| `gpuTranscodeImageData(...)` | 1950-2231 | Full two-pass compute dispatch |
+| `initTranscoderPipeline(VkDevice)` | 1700-1840 | Creates decode + encode pipelines, DSLs, shared pool |
+| `ensureTcScratch(VkDevice, ...)` | 1828-1922 | Persistent RGBA8 scratch SSBO |
+| `bcnFormatToId(VkFormat)` | 556-576 | Maps BCn format → integer ID for decode shader push constant |
 
-**To activate, you would need to:**
-1. In `DxvkDevice::createImage()`: swap `createInfo.format` to the ASTC format
-2. In `DxvkContext::uploadImageFb|Hw()`: call `transcodeImageData()` on staging buffer
-3. Verify block-size alignment on real Adreno 6xx/7xx hardware
+**Two-pass compute pipeline (Approach A — independent submit):**
 
-**Block-size risk:** BCn is always 4×4 blocks. ASTC uses 5×5 or 6×6 blocks.
-Most game textures are power-of-2 (512, 1024, 2048) which are NOT multiples
-of 5 or 6. The partial edge texels at the right/bottom may cause issues on
-Turnip. This must be verified on hardware before activation.
+```
+srcBuffer (BCn data)              dstBuffer (ASTC data)
+       │                                  ▲
+       ▼                                  │
+┌──────────────┐     ┌──────────────────────────────┐
+│ Pass 1:      │     │ Pass 2:                      │
+│ BCn→RGBA8    │────▶│ RGBA8→ASTC 4×4               │
+│              │     │ (leegao's encoder, PCA-based) │
+│ scratch SSBO │     │ LUT2 + LUT S2 bound as SSBOs  │
+└──────────────┘     └──────────────────────────────┘
+       │                                  │
+       └──────── scratchBarrier ──────────┘
+       (SHADER_WRITE → SHADER_READ)
+```
+
+**Pass 1 — Decode (`vegas_bcn_decode.comp`):**
+- Workgroups: `ceil(w/4) × ceil(h/4) × 1`
+- Descriptors: `srcBuffer@0 (read)`, `scratchBuffer@1 (write)`
+- Push constants: `{texWidth, texHeight, formatId}`
+- Decodes BC1–BC7 → RGBA8 uint texels (R|G<<8|B<<16|A<<24)
+
+**Pass 2 — Encode (`astc_enc_leegao.comp`):**
+- Workgroups: `ceil(w/4) × ceil(h/4) × 1`
+- Descriptors: `scratchBuffer@0 (read)`, `dstBuffer@1 (write)`,
+  `lut2@2 (read)`, `lutS2@3 (read)`
+- Push constants: `{texWidth, texHeight, flags}`
+- flags: `bit 0=try_2p`, `bit 1=only_2p` — currently `flags=2` (try 2P, compare MSE)
+- PCA-based compression with 2-partition mode support
+
+**Integration point** (`src/d3d11/d3d11_initializer.cpp`):
+
+1. `DxvkDevice::createImage()` detects BCn format → calls `shouldTranscodeFormat()`
+   → if ASTC returned, sets `DxvkImageCreateInfo::originalFormat` and swaps image
+   format to ASTC 4×4 (commit `bb7b8b1`)
+2. `D3D11Initializer::InitDeviceLocalTexture()`:
+   - Detects `originalFormat != VK_FORMAT_UNDEFINED`
+   - Computes `needsAstcStaging = (elementSize < 16)` → doubles staging allocation
+   - Packs BCn data into staging buffer at ASTC-sized strides
+   - Calls `gpuTranscodeImageData()` for each mip/layer (blocking fence wait)
+   - CS lambda copies ASTC data from staging → image as usual
+3. `uploadImageHw()` uses `image->info().format` (ASTC) for mip size computation
+   — staging offsets match the ASTC-laid-out data
+
+**Block-size alignment:**
+- All BCn formats use 4×4 blocks → map 1:1 to ASTC 4×4
+- Non-power-of-2 and odd-dimension textures: `ceil(w/4) × ceil(h/4)` workgroups
+  handle partial edge texels correctly (shaders zero-pad)
+- BC3/BC5/BC7 (16 B/block) → staging sized naturally for ASTC 4×4 (also 16 B/block)
+- BC1/BC4 (8 B/block) → staging allocation doubled per layer (commit `19c9a86`)
+
+**Pipeline resources** (lazy-created on first call):
+- 2× `VkPipeline` + `VkPipelineLayout` + `VkDescriptorSetLayout` (decode + encode)
+- 1× `VkDescriptorPool` (shared, 2 sets)
+- 1× persistent scratch buffer (RGBA8, sized to largest texture seen)
+- 2× LUT SSBOs (created once, never destroyed)
+- Transient command pool/buffer/fence per call (created, submitted, waited, destroyed)
+
+**Scratch buffer sizing:**
+```
+requiredTexels = blocksX * 4 * blocksY * 4  (RGBA8 at full resolution)
+scratchSize    = requiredTexels * 4           (bytes)
+```
+Reallocated on grow-only basis via `ensureTcScratch()`.
+
+**Format-to-ID mapping for decode shader:**
+
+| Format ID | BCn Format |
+|-----------|------------|
+| 0 | BC1_RGB / BC1_SRGB |
+| 1 | BC2 / BC2_SRGB |
+| 2 | BC3 / BC3_SRGB |
+| 3 | BC4_UNORM / BC4_SNORM |
+| 4 | BC5_UNORM / BC5_SNORM |
+| 5 | BC6H_SFLOAT / BC6H_UFLOAT |
+| 6 | BC7 / BC7_SRGB |
+
+**Performance expectation:**
+- ~0.15–0.26 ms per mip/layer (vs 5.5–22 ms CPU for same work)
+- Independent submit avoids DXVK CS thread contention
+- In-place staging avoids extra allocation/copy for same-block-size formats
+
+**Failure behavior:** Returns `false` on any error (shader compile, pipeline
+creation, dispatch failure). Caller logs a warning and continues with
+untranscoded data (image is ASTC format but staging has BCn data → garbage,
+but game continues without crash). All errors are non-fatal.
 
 ---
 
@@ -722,10 +805,11 @@ adb logcat -s "DXVK" | grep -E "ERROR|WARN|VUID"
 - `thread_local` in `tuneThreshold()` and `analyzePerformance()` prevents
   cross-context interference
 
-### "The gated BCn→ASTC transcoder is NOT ready"
-- Do NOT enable it without wiring the upload pipeline
-- Block-size alignment (4×4 BCn → 5×5/6×6 ASTC) will cause validation errors
-- Test each ASTC block size on target hardware before activation
+### "The GPU BCn→ASTC transcoder block-size alignment is verified"
+- All BCn formats use 4×4 blocks → map 1:1 to ASTC 4×4
+- BC1/BC4 (8 B/block) staging buffer is doubled for 16 B/block ASTC output
+- Odd/non-power-of-2 dimensions handled by `ceil(w/4)×ceil(h/4)` workgroups with zero-padding
+- Test each additional ASTC block size on target hardware before expanding beyond 4×4
 
 ### "Config option namespaces"
 - `dxvk.*` — DXVK core options (in `dxvk_options.cpp`)
@@ -764,6 +848,7 @@ FSR viable on Turnip.
 - **Lead Developer:** isygold
 - **Base Project:** DXVK v2.7.1+ by doitsujin
 - **Timeline Semaphore:** leegao (DxvkFence)
+- **ASTC GPU Encoder:** leegao — PCA-based RGBA8→ASTC 4×4 compute shader with 2-partition mode support; ported and integrated by isygold
 - **License:** zlib/libpng
 
 ---

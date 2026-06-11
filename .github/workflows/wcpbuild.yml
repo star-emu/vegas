@@ -26,8 +26,8 @@ jobs:
           RUN_JSON=$(gh run list --repo ${{ github.repository }} --workflow build.yml --branch ${{ github.ref_name }} \
             --status success --limit 1 --json headSha,databaseId)
           if [ -z "$RUN_JSON" ] || [ "$RUN_JSON" = "[]" ]; then
-            echo "::error::No successful build.yml runs found on branch vegas."
-            echo "::error::Trigger a Build DXVK (x64 + x32) workflow first."
+            echo "::error::No successful build.yml runs found on branch '${{ github.ref_name }}'."
+            echo "::error::Trigger a Build DXVK (x64 + x32) workflow first on the same branch."
             exit 1
           fi
           FULL_SHA=$(echo "$RUN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['headSha'])")

@@ -52,6 +52,16 @@ Available on Tier 2 (≤29 ms frametime) and Tier 3 (≤33 ms frametime):
 
 Compute-only pipeline. Disabled on Tier 1 (insufficient compute budget).
 
+### GPU BCn→ASTC Compute Transcoder (`release-v2` branch)
+Two-pass compute pipeline that converts BCn (DXT) compressed textures to ASTC 4×4
+before GPU upload — entirely on-device, no CPU transcoding:
+- **Pass 1** — `vegas_bcn_decode.comp` decodes BC1–BC7 blocks to RGBA8 texels (scratch SSBO)
+- **Pass 2** — `astc_enc_leegao.comp` (PCA-based) re-encodes RGBA8 → ASTC 4×4 blocks in-place
+- Covers **BC1 through BC7** (BC1/BC4 use 2× staging allocation for 8→16 B/block expansion)
+- Blocking submit (`vkWaitForFences`) per mip/layer before upload copy — zero DXVK state touched
+- Requires Mesa Turnip with ASTC decode support; no benefit on Qualcomm proprietary blob
+- File: `src/dxvk/dxvk_vegas.cpp` → `gpuTranscodeImageData()` (~line 1950)
+
 ### Adaptive Governor — TBDR-Inverted (`tuneThreshold`)
 EMA-smoothed frame-time telemetry with **15-frame cooldown** for responsive load balancing:
 - **GPU-bound** (load>0.90, ft>25ms) → **RAISE** threshold (batch more, amortize submission overhead)
@@ -162,9 +172,16 @@ The output DLLs (`d3d9.dll`, `d3d11.dll`, `dxgi.dll`, etc.) are placed in `/outp
 
 ## Changelog (VEGAS)
 
-| Commit | Feature |
-|--------|---------|
-| `HEAD` | **Remove VegasHud overlay.** Color-coded frametime graph replaces standalone overlay. `DXVK_HUD=frametimes` now shows dynamic colors (green→yellow→orange→red) and state label |
+| Branch | Commit | Feature |
+|--------|--------|---------|
+| `release-v2` | `19c9a86` | **Batch 5/5 — BC1/BC4 staging buffer resize.** 2× staging allocation for 8→16 B/block ASTC expansion. All BCn formats now transcode. |
+| `release-v2` | `12b00bb` | **Batch 4/5 — Upload path wiring.** `getAstcFormat()` → 4×4 exclusively. `InitDeviceLocalTexture()` calls `gpuTranscodeImageData()` after pack for BC3/5/7. |
+| `release-v2` | `bb7b8b1` | **Batch 3/5 — Format swap in createImage.** `DxvkImageCreateInfo::originalFormat` stashed; image format swapped to ASTC when eligible. |
+| `release-v2` | `766b8c1` | **Batch 2/5 — gpuTranscodeImageData dispatch.** Two-pass compute: decode BCn→RGBA8, encode RGBA8→ASTC 4×4. Independent submit + fence wait. |
+| `release-v2` | `fc06f55` | **Batch 1/5 — Pipeline init infrastructure.** `createStaticSsbo()`, `initTranscoderPipeline()`, decode + encode pipelines with separate DSLs. |
+| `release-v2` | `41bb85b` | **Step 2 — leegao's ASTC encoder.** `astc_enc_leegao.comp` (PCA-based, 4×4) compiled to SPIR‑V. LUT data (47 KB total) as C headers. |
+| `release-v2` | `22d4ba5` | **Step 1 — BCn decode shader.** `vegas_bcn_decode.comp` compiled to SPIR‑V v1.5, C header generated. |
+| `vegas` | `HEAD` | **Remove VegasHud overlay.** Color-coded frametime graph replaces standalone overlay. `DXVK_HUD=frametimes` now shows dynamic colors (green→yellow→orange→red) and state label |
 | `07914da` | **VegasHud:** positioning fix (char width 8→10.5px), ASCII bar graph (20-bar × 4-level), leegao credits |
 | `24e48a3` | **Stable release:** WCP versionCode 0→1, WCP CI checkout fix |
 | `735e09e` | **WCP CI:** remove vkResetCommandBuffer from async FSR (not in FsrVulkanFuncs) |
@@ -184,7 +201,7 @@ The output DLLs (`d3d9.dll`, `d3d11.dll`, `dxgi.dll`, etc.) are placed in `/outp
 
 - **Tier 1 (Adreno 5xx/6xx low-end):** Frame generation disabled. FSR available but not recommended at very low resolutions.
 - **Performance state coloring:** The upstream frametime graph (`DXVK_HUD=frametimes`) now reflects the current Vegas performance state in real time — no separate HUD overlay needed.
-- **BCn→ASTC transcoder:** Implemented but deferred — the simplified encoder produces visual quality loss that outweighs the narrow benefit (only helps old Qualcomm blob, not Turnip). Available in code for future developers who want to integrate a proper encoder (e.g., `ispc_texcomp`).
+- **GPU BCn→ASTC transcoder (release-v2):** Active two-pass compute pipeline on `release-v2` branch. BCn→RGBA8 decode + leegao's PCA-based ASTC 4×4 encoder runs before GPU upload. Covers BC1–BC7. Requires Mesa Turnip (proprietary blob does not support ASTC decode). See "GPU BCn→ASTC Compute Transcoder" under Key Features.
 - **Turnip driver:** Use Mesa 25.x+ with Vulkan 1.3 support for descriptor indexing and push constants.
 - **Synthetic benchmarks:** May show lower FPS than stock due to draw thresholds. Judge performance by actual gameplay smoothness.
 - **GPU-bound workloads:** VSync-off provides negligible gain when the GPU is already saturated (17+ ms frame times).
@@ -196,6 +213,7 @@ The output DLLs (`d3d9.dll`, `d3d11.dll`, `dxgi.dll`, etc.) are placed in `/outp
 - **Lead Developer:** isygold
 - **Base Project:** DXVK v2.7.1+ by doitsujin
 - **Timeline Semaphore (DxvkFence):** leegao — enabled non-blocking async FSR dispatch on Turnip
+- **ASTC GPU Encoder (astc_enc_leegao):** leegao — PCA-based RGBA8→ASTC 4×4 compute shader with 2-partition mode support; ported and integrated by isygold
 - **License:** zlib/libpng
 
 ---
