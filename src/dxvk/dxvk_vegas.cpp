@@ -2252,8 +2252,8 @@ namespace dxvk {
                               " (", numBlocks, " blocks) BCn->ASTC"));
     return true;
   }
-   *  Creates a private VkImage with STORAGE_BIT + TRANSFER_SRC_BIT.
-   *  Destroys and recreates if dimensions changed (swapchain resize). */
+  // Creates a private VkImage with STORAGE_BIT + TRANSFER_SRC_BIT.
+  // Destroys and recreates if dimensions changed (swapchain resize).
   static bool ensureFsrIntermediate(VkDevice device, VkExtent3D extent) {
     if (Vegas::s_fsrInterImage != 0 && Vegas::s_fsrInterW == extent.width && Vegas::s_fsrInterH == extent.height) {
       return true;  // already exists at correct size
