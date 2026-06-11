@@ -1,0 +1,329 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// ============================================================
+// vegas_bcn_decode.comp — GPU BCn→RGBA8 decoder
+//
+// Each invocation decodes one 4×4 BCn block to 16 RGBA8 pixels.
+// Output format matches leegao's astc_enc.comp input layout:
+//   uint pixel = R | (G << 8) | (B << 16) | (A << 24)
+//
+// Dispatch: local_size_x=8, local_size_y=8
+//   grid_x = (width  + 3) / 4  (rounded up to block count)
+//   grid_y = (height + 3) / 4
+// ============================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// ---- Format constants (must match C++ enum) ----
+const uint FMT_BC1 = 0u;  // BC1_RGB / BC1_RGBA  —  8 bytes/block
+const uint FMT_BC3 = 1u;  // BC3_UNORM / BC3_SRGB — 16 bytes/block
+const uint FMT_BC4 = 2u;  // BC4_UNORM / BC4_SNORM —  8 bytes/block
+const uint FMT_BC5 = 3u;  // BC5_UNORM / BC5_SNORM — 16 bytes/block
+const uint FMT_BC7 = 4u;  // BC7_UNORM / BC7_SRGB — 16 bytes/block
+
+// ---- Push constants ----
+layout(push_constant) uniform PC {
+    ivec2 u_ImageSize;    // width, height in pixels
+    uint  u_SrcFormat;    // one of FMT_BC*
+} pc;
+
+// ---- SSBOs ----
+layout(std430, binding = 0) readonly  buffer Src  { uint data[]; } src;
+layout(std430, binding = 1)           buffer Dst  { uint data[]; } dst;
+
+// ============================================================
+// BC1 decoder  (DXT1 — 8 bytes/block)
+// ============================================================
+void decodeBC1(uint blockIdx, inout uint pixels[16]) {
+    uint w0 = src.data[blockIdx * 2u + 0u];
+    uint w1 = src.data[blockIdx * 2u + 1u];
+
+    uint c0 = w0 & 0xFFFFu;
+    uint c1 = (w0 >> 16u) & 0xFFFFu;
+    uint idxBits = w1;
+
+    // Expand R/G/B from 5/6/5 to 8-bit
+    uint r0 = (c0 >> 11u) * 255u / 31u;
+    uint g0 = ((c0 >> 5u) & 0x3Fu) * 255u / 63u;
+    uint b0 = (c0 & 0x1Fu) * 255u / 31u;
+
+    uint r1 = (c1 >> 11u) * 255u / 31u;
+    uint g1 = ((c1 >> 5u) & 0x3Fu) * 255u / 63u;
+    uint b1 = (c1 & 0x1Fu) * 255u / 31u;
+
+    uint ra[4], ga[4], ba[4];
+    ra[0] = r0; ga[0] = g0; ba[0] = b0;
+    ra[1] = r1; ga[1] = g1; ba[1] = b1;
+
+    bool opaque = c0 > c1;
+    if (opaque) {
+        ra[2] = (2u * r0 + r1) / 3u; ga[2] = (2u * g0 + g1) / 3u; ba[2] = (2u * b0 + b1) / 3u;
+        ra[3] = (r0 + 2u * r1) / 3u; ga[3] = (g0 + 2u * g1) / 3u; ba[3] = (b0 + 2u * b1) / 3u;
+    } else {
+        ra[2] = (r0 + r1) / 2u;       ga[2] = (g0 + g1) / 2u;       ba[2] = (b0 + b1) / 2u;
+        ra[3] = 0u;                   ga[3] = 0u;                   ba[3] = 0u;
+    }
+
+    for (int i = 0; i < 16; i++) {
+        uint idx = (idxBits >> (uint(i) * 2u)) & 3u;
+        uint a = opaque ? 255u : ((idx == 3u) ? 0u : 255u);
+        pixels[i] = ra[idx] | (ga[idx] << 8u) | (ba[idx] << 16u) | (a << 24u);
+    }
+}
+
+// ============================================================
+// BC4 decoder (single-channel — 8 bytes/block)
+// ============================================================
+void decodeBC4(uint blockIdx, inout uint pixels[16]) {
+    uint w0 = src.data[blockIdx * 2u + 0u];
+    uint w1 = src.data[blockIdx * 2u + 1u];
+
+    uint red0 = w0 & 0xFFu;
+    uint red1 = (w0 >> 8u) & 0xFFu;
+
+    // 48-bit index stream packed across w0[16:31], w1[0:31]
+    uint64_t idxBits = uint64_t(w0 >> 16u)
+                     | (uint64_t(w1) << 16u);
+
+    // Must use GL_EXT_shader_explicit_arithmetic_types_int64 — already loaded
+    for (int i = 0; i < 16; i++) {
+        uint idx = uint((idxBits >> (uint(i) * 3u)) & 7u);
+        uint a;
+        if (red0 > red1) {
+            // 6 interpolated levels
+            a = (red0 * (7u - idx) + red1 * idx) / 7u;
+        } else {
+            if (idx == 0u)       a = red0;
+            else if (idx == 1u)  a = red1;
+            else if (idx <= 5u)  a = ((6u - idx) * red0 + (idx - 1u) * red1) / 5u;
+            else                 a = 0u;
+        }
+        pixels[i] = a | (a << 8u) | (a << 16u) | (255u << 24u);
+    }
+}
+
+// ============================================================
+// BC3 decoder (DXT5 — 16 bytes/block = BC1 + BC4 alpha)
+// ============================================================
+void decodeBC3(uint blockIdx, inout uint pixels[16]) {
+    // First 8 bytes: BC4 alpha
+    uint w0 = src.data[blockIdx * 4u + 0u];
+    uint w1 = src.data[blockIdx * 4u + 1u];
+
+    uint a0 = w0 & 0xFFu;
+    uint a1 = (w0 >> 8u) & 0xFFu;
+    uint64_t alphaIdx = uint64_t(w0 >> 16u)
+                      | (uint64_t(w1) << 16u);
+
+    // Next 8 bytes: BC1 color
+    uint w2 = src.data[blockIdx * 4u + 2u];
+    uint w3 = src.data[blockIdx * 4u + 3u];
+
+    uint c0 = w2 & 0xFFFFu;
+    uint c1 = (w2 >> 16u) & 0xFFFFu;
+    uint colIdx = w3;
+
+    // Expand colors
+    uint r0 = (c0 >> 11u) * 255u / 31u;
+    uint g0 = ((c0 >> 5u) & 0x3Fu) * 255u / 63u;
+    uint b0 = (c0 & 0x1Fu) * 255u / 31u;
+
+    uint r1 = (c1 >> 11u) * 255u / 31u;
+    uint g1 = ((c1 >> 5u) & 0x3Fu) * 255u / 63u;
+    uint b1 = (c1 & 0x1Fu) * 255u / 31u;
+
+    uint ra[4], ga[4], ba[4];
+    ra[0] = r0; ga[0] = g0; ba[0] = b0;
+    ra[1] = r1; ga[1] = g1; ba[1] = b1;
+
+    bool opaque = c0 > c1;
+    if (opaque) {
+        ra[2] = (2u * r0 + r1) / 3u; ga[2] = (2u * g0 + g1) / 3u; ba[2] = (2u * b0 + b1) / 3u;
+        ra[3] = (r0 + 2u * r1) / 3u; ga[3] = (g0 + 2u * g1) / 3u; ba[3] = (b0 + 2u * b1) / 3u;
+    } else {
+        ra[2] = (r0 + r1) / 2u;       ga[2] = (g0 + g1) / 2u;       ba[2] = (b0 + b1) / 2u;
+        ra[3] = 0u;                   ga[3] = 0u;                   ga[3] = 0u; // ga[3]=0 is fine for 1-bit alpha
+    }
+
+    for (int i = 0; i < 16; i++) {
+        uint colIdxVal = (colIdx >> (uint(i) * 2u)) & 3u;
+        uint alphaIdxVal = uint((alphaIdx >> (uint(i) * 3u)) & 7u);
+
+        uint r, g, b;
+        r = ra[colIdxVal]; g = ga[colIdxVal]; b = ba[colIdxVal];
+
+        uint a;
+        if (a0 > a1) {
+            a = (a0 * (7u - alphaIdxVal) + a1 * alphaIdxVal) / 7u;
+        } else {
+            if (alphaIdxVal == 0u)        a = a0;
+            else if (alphaIdxVal == 1u)   a = a1;
+            else if (alphaIdxVal <= 5u)   a = ((6u - alphaIdxVal) * a0 + (alphaIdxVal - 1u) * a1) / 5u;
+            else                          a = 0u;
+        }
+
+        pixels[i] = r | (g << 8u) | (b << 16u) | (a << 24u);
+    }
+}
+
+// ============================================================
+// BC5 decoder (two-channel — 16 bytes/block = BC4 + BC4)
+// ============================================================
+void decodeBC5(uint blockIdx, inout uint pixels[16]) {
+    // First BC4: red channel
+    uint w0 = src.data[blockIdx * 4u + 0u];
+    uint w1 = src.data[blockIdx * 4u + 1u];
+
+    uint r0 = w0 & 0xFFu;
+    uint r1 = (w0 >> 8u) & 0xFFu;
+    uint64_t rIdx = uint64_t(w0 >> 16u)
+                  | (uint64_t(w1) << 16u);
+
+    // Second BC4: green channel
+    uint w2 = src.data[blockIdx * 4u + 2u];
+    uint w3 = src.data[blockIdx * 4u + 3u];
+
+    uint g0v = w2 & 0xFFu;
+    uint g1v = (w2 >> 8u) & 0xFFu;
+    uint64_t gIdx = uint64_t(w2 >> 16u)
+                  | (uint64_t(w3) << 16u);
+
+    for (int i = 0; i < 16; i++) {
+        uint ridx = uint((rIdx >> (uint(i) * 3u)) & 7u);
+        uint gidx = uint((gIdx >> (uint(i) * 3u)) & 7u);
+
+        uint rv, gv;
+        // Red
+        if (r0 > r1) {
+            rv = (r0 * (7u - ridx) + r1 * ridx) / 7u;
+        } else {
+            if (ridx == 0u)      rv = r0;
+            else if (ridx == 1u) rv = r1;
+            else if (ridx <= 5u) rv = ((6u - ridx) * r0 + (ridx - 1u) * r1) / 5u;
+            else                 rv = 0u;
+        }
+        // Green
+        if (g0v > g1v) {
+            gv = (g0v * (7u - gidx) + g1v * gidx) / 7u;
+        } else {
+            if (gidx == 0u)      gv = g0v;
+            else if (gidx == 1u) gv = g1v;
+            else if (gidx <= 5u) gv = ((6u - gidx) * g0v + (gidx - 1u) * g1v) / 5u;
+            else                 gv = 0u;
+        }
+
+        pixels[i] = rv | (gv << 8u) | (0u << 16u) | (255u << 24u);
+    }
+}
+
+// ============================================================
+// BC7 decoder (simplified — mode 5 only, 16 bytes/block)
+// ============================================================
+void decodeBC7(uint blockIdx, inout uint pixels[16]) {
+    uint w0 = src.data[blockIdx * 4u + 0u];
+    uint w1 = src.data[blockIdx * 4u + 1u];
+    uint w2 = src.data[blockIdx * 4u + 2u];
+    uint w3 = src.data[blockIdx * 4u + 3u];
+
+    uint mode = w0 & 0xFFu;
+
+    // Default: 128,128,128,255
+    for (int i = 0; i < 16; i++) {
+        pixels[i] = 128u | (128u << 8u) | (128u << 16u) | (255u << 24u);
+    }
+
+    // Mode 5 check: bit 7 set
+    if ((mode & 0x80u) == 0u)
+        return;
+
+    // Extract 7-bit endpoints (cross-byte)
+    uint r0 = (((w0 >> 9u) & 0x7Fu) << 1u) | ((w0 >> 23u) & 1u);
+    uint r1 =  ((w0 >> 24u) & 0x7Fu) << 1u  | ((w1 >> 7u) & 1u);
+    uint g0 = (((w1 >> 1u) & 0x7Fu) << 1u)  | ((w1 >> 15u) & 1u);
+    uint g1 =  ((w1 >> 16u) & 0x7Fu) << 1u  | ((w2 >> 7u) & 1u);
+    uint b0 = (((w2 >> 1u) & 0x7Fu) << 1u)  | ((w2 >> 15u) & 1u);
+    uint b1 =  ((w2 >> 16u) & 0x7Fu) << 1u  | ((w3 >> 7u) & 1u);
+
+    // 8-bit alpha endpoints
+    uint a0 = (w3 >> 8u) & 0xFFu;
+    uint a1 = (w3 >> 16u) & 0xFFu;
+
+    // 48-bit index stream (remaining bits + following uints)
+    uint64_t idxBits = uint64_t(w3 >> 24u)
+                     | (uint64_t(src.data[blockIdx * 4u + 3u] >> 24u) << 8u); // just in case
+    // Simplified: read 6 bytes starting at byte 10
+    // Bytes 10-15 = bits 80-127
+    // Byte 10 = (w2 >> 16) & 0xFF  bits 16-23 of w2
+    // Actually let me compute this properly:
+    // word layout: w0=bytes0-3, w1=bytes4-7, w2=bytes8-11, w3=bytes12-15
+    // Byte 10 = byte index 10 = word index 2, byte offset 2 = bits 16-23 of w2
+    // Let me pack 6 bytes from the right positions:
+    uint byte10 = (w2 >> 16u) & 0xFFu;
+    uint byte11 = (w2 >> 24u) & 0xFFu;
+    uint byte12 = w3 & 0xFFu;
+    uint byte13 = (w3 >> 8u) & 0xFFu;
+    uint byte14 = (w3 >> 16u) & 0xFFu;
+    uint byte15 = (w3 >> 24u) & 0xFFu;
+
+    uint64_t indices = uint64_t(byte10)
+                     | (uint64_t(byte11) << 8u)
+                     | (uint64_t(byte12) << 16u)
+                     | (uint64_t(byte13) << 24u)
+                     | (uint64_t(byte14) << 32u)
+                     | (uint64_t(byte15) << 40u);
+
+    for (int i = 0; i < 16; i++) {
+        uint idx = uint((indices >> (uint(i) * 4u)) & 0xFu);
+        uint rv = (r0 * (64u - idx) + r1 * idx) * 255u / (63u * 64u);
+        uint gv = (g0 * (64u - idx) + g1 * idx) * 255u / (63u * 64u);
+        uint bv = (b0 * (64u - idx) + b1 * idx) * 255u / (63u * 64u);
+        uint av = (a0 * (64u - idx) + a1 * idx) * 255u / (63u * 64u);
+        pixels[i] = rv | (gv << 8u) | (bv << 16u) | (av << 24u);
+    }
+}
+
+// ============================================================
+// Main entry point
+// ============================================================
+void main() {
+    ivec2 blockCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imgSize = pc.u_ImageSize;
+
+    int numBlocksX = (imgSize.x + 3) / 4;
+    int numBlocksY = (imgSize.y + 3) / 4;
+
+    if (blockCoord.x >= numBlocksX || blockCoord.y >= numBlocksY)
+        return;
+
+    uint blockIdx = uint(blockCoord.y) * uint(numBlocksX) + uint(blockCoord.x);
+
+    uint pixels[16];
+
+    switch (pc.u_SrcFormat) {
+        case FMT_BC1: decodeBC1(blockIdx, pixels); break;
+        case FMT_BC3: decodeBC3(blockIdx, pixels); break;
+        case FMT_BC4: decodeBC4(blockIdx, pixels); break;
+        case FMT_BC5: decodeBC5(blockIdx, pixels); break;
+        case FMT_BC7: decodeBC7(blockIdx, pixels); break;
+        default:
+            return; // unsupported format
+    }
+
+    // Write 16 pixels to output buffer (row-major)
+    uint baseX = uint(blockCoord.x) * 4u;
+    uint baseY = uint(blockCoord.y) * 4u;
+    uint width = uint(imgSize.x);
+
+    [[unroll]] for (int py = 0; py < 4; py++) {
+        [[unroll]] for (int px = 0; px < 4; px++) {
+            int pixelIdx = py * 4 + px;
+            uint outX = baseX + uint(px);
+            uint outY = baseY + uint(py);
+            if (outX < uint(imgSize.x) && outY < uint(imgSize.y)) {
+                dst.data[outY * width + outX] = pixels[pixelIdx];
+            }
+        }
+    }
+}
