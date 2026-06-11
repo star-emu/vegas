@@ -450,7 +450,7 @@ namespace dxvk {
       return statusTable[static_cast<int>(state)];
   }
 
-  // VEGAS: ASTC helpers — used by the gated shouldTranscodeFormat/transcodeImageData
+  // VEGAS: ASTC helpers — used by shouldTranscodeFormat and gpuTranscodeImageData
   bool Vegas::formatIsBcn(VkFormat format) {
     switch (format) {
       case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
@@ -476,50 +476,53 @@ namespace dxvk {
   }
 
   VkFormat Vegas::getAstcFormat(VkFormat bcnFormat) {
+    // NOTE: Only ASTC 4×4 block size is supported. The GPU compute encoder
+    // (leegao's astc_enc_leegao.comp) is hardcoded for 4×4 blocks with a
+    // local_size of (8,8,1). Using 5×5 or 6×6 would require a different
+    // shader and would break the block-size alignment guarantee that allows
+    // in-place staging buffer transcoding for same-size BCn formats.
     switch (bcnFormat) {
       case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
       case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
       case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
       case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
-        return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+        return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
 
       case VK_FORMAT_BC2_UNORM_BLOCK:
-        return VK_FORMAT_ASTC_5x5_UNORM_BLOCK;
+        return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
       case VK_FORMAT_BC2_SRGB_BLOCK:
-        return VK_FORMAT_ASTC_5x5_SRGB_BLOCK;
+        return VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
 
       case VK_FORMAT_BC3_UNORM_BLOCK:
-        return VK_FORMAT_ASTC_5x5_UNORM_BLOCK;
+        return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
       case VK_FORMAT_BC3_SRGB_BLOCK:
-        return VK_FORMAT_ASTC_5x5_SRGB_BLOCK;
+        return VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
 
       case VK_FORMAT_BC4_UNORM_BLOCK:
       case VK_FORMAT_BC4_SNORM_BLOCK:
-        return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+        return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
 
       case VK_FORMAT_BC5_UNORM_BLOCK:
       case VK_FORMAT_BC5_SNORM_BLOCK:
-        return VK_FORMAT_ASTC_5x5_UNORM_BLOCK;
+        return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
 
       case VK_FORMAT_BC6H_UFLOAT_BLOCK:
       case VK_FORMAT_BC6H_SFLOAT_BLOCK:
         return VK_FORMAT_UNDEFINED;
 
       case VK_FORMAT_BC7_UNORM_BLOCK:
-        return VK_FORMAT_ASTC_5x5_UNORM_BLOCK;
+        return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
       case VK_FORMAT_BC7_SRGB_BLOCK:
-        return VK_FORMAT_ASTC_5x5_SRGB_BLOCK;
+        return VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
 
       default:
         return VK_FORMAT_UNDEFINED;
     }
   }
 
-  // GATED FEATURE — see comment above transcodeImageData() for rationale.
-  // Currently logs when a texture would benefit from ASTC but does NOT modify
-  // the format. Flip the switch in createImage() only after the upload-path
-  // transcoding pipeline is wired AND block-size alignment is verified on
-  // real Adreno 6xx/7xx hardware.
+  // GPU transcoder — see gpuTranscodeImageData() for the active implementation.
+  // Modifies the image format when shouldTranscodeFormat() returns ASTC;
+  // Batch 3 wires this in DxvkDevice::createImage().
   VkFormat Vegas::shouldTranscodeFormat(
       VkFormat              originalFormat,
       VkImageUsageFlags     usage,
@@ -554,35 +557,31 @@ namespace dxvk {
   }
 
   // ============================================================
-  // CPU-side BCn->ASTC transcoder (GATED — NOT ACTIVATED YET)
+  // GPU BCn→ASTC transcoder (ACTIVE — see gpuTranscodeImageData)
   // ============================================================
   //
-  // Rationale: On older Adreno 6xx GPUs the closed-source Qualcomm
-  // driver decodes BCn in software at draw time, causing mid-frame
-  // CPU stalls. Pre-transcoding BCn→ASTC at upload time moves that
-  // decode cost to loading where it's harmless. On Adreno 8xx with
-  // native BCn hardware this buys nothing — but Star Engine targets
-  // the full range of Android devices.
+  // Replaced the gated CPU transcoder with a GPU compute pipeline:
+  //   Pass 1: BCn → RGBA8  (vegas_bcn_decode.comp, custom shader)
+  //   Pass 2: RGBA8 → ASTC (leegao's astc_enc_leegao.comp, 4×4)
   //
-  // Why it's still gated:
-  //   1. Block-size mismatch — BCn uses 4×4 blocks, ASTC uses 5×5
-  //      or 6×6. Most game textures (power-of-2) don't align, so
-  //      vkCmdCopyBufferToImage would fail validation.
-  //   2. Upload pipeline — the staging buffer contains BCn data;
-  //      format-swapping the VkImage without also transcoding the
-  //      pixel data produces garbage.
-  //   3. Untested — written speculatively, never run end-to-end.
+  // All ASTC target formats now use 4×4 block size so that BC3/BC5/BC7
+  // (16 bytes/block) can be transcoded in-place in the staging buffer
+  // without re-allocation. BC1/BC4 (8 bytes/block) are skipped at
+  // runtime with a debug log — they need a larger staging buffer.
   //
-  // To activate:
-  //   a) In DxvkDevice::createImage(): swap createInfo.format to
-  //      the ASTC format returned by shouldTranscodeFormat().
-  //   b) In DxvkContext::uploadImage[Fb|Hw](): call
-  //      transcodeImageData() on the staging buffer before the
-  //      vkCmdCopyBufferToImage call.
-  //   c) Verify block-size alignment on real Adreno 6xx/7xx hw.
+  // Activation path (implemented across Batches 3–4):
+  //   a) DxvkDevice::createImage() — swap format to ASTC 4×4,
+  //      stash originalFormat in DxvkImageCreateInfo.
+  //   b) D3D11Initializer::InitDeviceLocalTexture() — after packing
+  //      BCn data into staging buffer, call gpuTranscodeImageData()
+  //      to convert BCn→ASTC in-place before the CS upload lambda.
   //
-  // Until then this entire section is dead code — kept for future
-  // bring-up.
+  // Remaining gap: BC1/4 need a larger staging buffer (ASTC 4×4 is
+  // 16 B/block vs 8 B/block). Activate by extending the staging
+  // buffer allocation when originalFormat.elementSize < 16.
+  //
+  // The CPU transcoder below is dead code (zero call sites) — kept as
+  // a reference implementation for debugging the GPU pipeline.
   // ============================================================
 
   namespace {

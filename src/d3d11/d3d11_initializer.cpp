@@ -4,6 +4,8 @@
 #include "d3d11_device.h"
 #include "d3d11_initializer.h"
 
+#include "../dxvk/dxvk_vegas.h"
+
 namespace dxvk {
 
   D3D11Initializer::D3D11Initializer(
@@ -208,6 +210,46 @@ namespace dxvk {
           }
         }
       }
+
+      // --- VEGAS: GPU BCn→ASTC transcoding (in-place, same block size only) ---
+      // After packing BCn data into the staging buffer, transcode it to ASTC
+      // in-place when the BCn and ASTC 4×4 block sizes match (BC3/BC5/BC7 —
+      // 16 bytes/block). For BC1/BC4 (8 bytes/block) the staging buffer is
+      // too small; those are skipped with a debug log.
+      VkFormat originalBcnFormat = image->info().originalFormat;
+      if (originalBcnFormat != VK_FORMAT_UNDEFINED && pTexture->HasImage()) {
+        const DxvkFormatInfo* bcFormatInfo = lookupFormatInfo(originalBcnFormat);
+        if (bcFormatInfo->elementSize >= 16) {
+          VkBuffer stagingVkBuffer = stagingSlice.buffer()->getSliceInfo().buffer;
+          VkDeviceSize tcOffset = stagingSlice.offset();
+
+          for (uint32_t mip = 0; mip < image->info().mipLevels; mip++) {
+            VkExtent3D mipExtent = image->mipLevelExtent(mip);
+
+            VkDeviceSize mipSizePerLayer = util::computeImageDataSize(
+              originalBcnFormat, mipExtent, bcFormatInfo->aspectMask);
+
+            for (uint32_t layer = 0; layer < image->info().numLayers; layer++) {
+              bool ok = Vegas::gpuTranscodeImageData(
+                  stagingVkBuffer, static_cast<uint32_t>(tcOffset),
+                  stagingVkBuffer, static_cast<uint32_t>(tcOffset),
+                  originalBcnFormat,
+                  mipExtent.width, mipExtent.height);
+              if (!ok) {
+                Logger::warn(str::format(
+                    "VEGAS: gpuTranscodeImageData failed for ",
+                    originalBcnFormat, " mip ", mip, " layer ", layer));
+              }
+              tcOffset += align(mipSizePerLayer, CACHE_LINE_SIZE);
+            }
+          }
+        } else {
+          Logger::debug(str::format(
+              "VEGAS: skipping BCn→ASTC for ", originalBcnFormat,
+              " (8 B/block, needs staging buffer resize)"));
+        }
+      }
+      // --- END VEGAS ---
 
       // Upload all subresources of the image in one go
       if (pTexture->HasImage()) {
