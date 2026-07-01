@@ -2,7 +2,7 @@
 
 # DXVK — StarEngine (Vegas Edition)
 
-**Version 2.7.3-vegas** — A DXVK fork with Adreno-optimized enhancements for mobile/ARM64 gaming via Wine. Built on the shoulders of the excellent [DXVK](https://github.com/doitsujin/dxvk) project by doitsujin.
+**Version 2.7.3-vegas** — A GPLAsync/DXVK fork with Adreno-optimized enhancements for mobile/ARM64 gaming via Wine. Built on the shoulders of [GPLAsync](https://github.com/ishitatsuyuki/GPLAsync) by ishitatsuyuki and the excellent [DXVK](https://github.com/doitsujin/dxvk) project by doitsujin.
 
 > **⚠️ Important:** This is a downstream fork. All improvements specific to this build are additive and fully config-gated — stock DXVK behavior is preserved when no StarEngine config options are set.
 
@@ -296,6 +296,6 @@ DXVK Native comes with a slim set of Windows header definitions required for D3D
 
 ---
 
-*StarEngine (Vegas Edition) is a downstream fork of DXVK. All upstream credit belongs to the DXVK contributors.*
+*StarEngine (Vegas Edition) is a downstream fork of GPLAsync/DXVK. All upstream credit belongs to ishitatsuyuki (GPLAsync) and the DXVK contributors.*
 
 > **For developers:** See [`DEV_README.md`](DEV_README.md) for the complete file-by-file mapping of all StarEngine changes — every modified function, line number, and feature.
