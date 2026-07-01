@@ -5,6 +5,8 @@
 </p>
 
 # VEGAS — GPLAsync/DXVK v2.7.3
+[![Sponsor](https://img.shields.io/badge/Sponsor-%24?logo=github&style=flat)](https://github.com/sponsors/isygold)
+
 ### Adreno-Tuned DXVK (via GPLAsync) for Android Emulation (Star Emulator / Winlator)
 
 VEGAS is a specialized performance fork of GPLAsync 2.7.1 (itself a DXVK fork) targeting **Qualcomm Adreno GPUs** on mobile. It features a tier-based auto-tuning engine, FSR 1.0 compute upscaling, motion-compensated frame generation, and dynamic driver safeguards — all behind a single master switch.
